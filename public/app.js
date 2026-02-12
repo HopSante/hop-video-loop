@@ -1,14 +1,12 @@
 // --- State ---
 let currentVideo = null;
-let loopCount = 0;
 let playbackStartTime = null;
 let timerInterval = null;
+let networkBaseUrl = '';
 
 // --- DOM ---
 const videoList = document.getElementById('video-list');
 const refreshBtn = document.getElementById('refresh-btn');
-const serverInfo = document.getElementById('server-info');
-const networkUrl = document.getElementById('network-url');
 
 const emptyState = document.getElementById('empty-state');
 const downloadState = document.getElementById('download-state');
@@ -20,7 +18,6 @@ const downloadInfo = document.getElementById('download-info');
 
 const videoPlayer = document.getElementById('video-player');
 const nowPlayingName = document.getElementById('now-playing-name');
-const loopCountEl = document.getElementById('loop-count');
 const totalTimeEl = document.getElementById('total-time');
 const playStatus = document.getElementById('play-status');
 const fullscreenBtn = document.getElementById('fullscreen-btn');
@@ -28,15 +25,13 @@ const stopBtn = document.getElementById('stop-btn');
 
 // --- Init ---
 async function init() {
-  await loadServerInfo();
-  await loadVideos();
+  loadServerInfo();
+  loadVideos();
 
-  refreshBtn.addEventListener('click', loadVideos);
+  refreshBtn.addEventListener('click', () => loadVideos(true));
   fullscreenBtn.addEventListener('click', toggleFullscreen);
   stopBtn.addEventListener('click', stopPlayback);
 
-  // Video events for seamless looping
-  videoPlayer.addEventListener('ended', handleVideoEnded);
   videoPlayer.addEventListener('playing', handleVideoPlaying);
   videoPlayer.addEventListener('pause', handleVideoPause);
   videoPlayer.addEventListener('error', handleVideoError);
@@ -47,21 +42,42 @@ async function loadServerInfo() {
   try {
     const res = await fetch('/api/info');
     const info = await res.json();
-    const url = `http://${info.ip}:${info.port}`;
-    networkUrl.textContent = url;
-    serverInfo.classList.remove('hidden');
+    networkBaseUrl = `http://${info.ip}:${info.port}`;
   } catch {
     // Non-critical
   }
 }
 
 // --- Video list ---
-async function loadVideos() {
+function createVideoItem(video) {
+  const item = document.createElement('div');
+  item.className = 'video-item' + (currentVideo?.id === video.id ? ' active' : '');
+  item.innerHTML = `
+    <div class="video-item-icon">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <polygon points="5 3 19 12 5 21 5 3"/>
+      </svg>
+    </div>
+    <div class="video-item-info">
+      <div class="video-item-name" title="${video.name}">${video.name}</div>
+      <div class="video-item-meta">
+        <span>${formatFileSize(video.size)}</span>
+        ${video.duration ? `<span>${formatDuration(video.duration)}</span>` : ''}
+        ${video.cached ? '<span class="video-item-cached">En cache</span>' : ''}
+      </div>
+    </div>
+  `;
+  item.addEventListener('click', () => selectVideo(video));
+  return item;
+}
+
+async function loadVideos(forceRefresh = false) {
   refreshBtn.classList.add('spinning');
   videoList.innerHTML = '<div class="loading-state"><div class="spinner"></div><p>Chargement des vidéos...</p></div>';
 
   try {
-    const res = await fetch('/api/videos');
+    const url = forceRefresh ? '/api/videos?refresh=1' : '/api/videos';
+    const res = await fetch(url);
     const videos = await res.json();
 
     if (videos.error) {
@@ -75,26 +91,70 @@ async function loadVideos() {
     }
 
     videoList.innerHTML = '';
+    const groups = {};
     videos.forEach(video => {
-      const item = document.createElement('div');
-      item.className = 'video-item' + (currentVideo?.id === video.id ? ' active' : '');
-      item.innerHTML = `
-        <div class="video-item-icon">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <polygon points="5 3 19 12 5 21 5 3"/>
-          </svg>
-        </div>
-        <div class="video-item-info">
-          <div class="video-item-name" title="${video.name}">${video.name}</div>
-          <div class="video-item-meta">
-            <span>${formatFileSize(video.size)}</span>
-            ${video.duration ? `<span>${formatDuration(video.duration)}</span>` : ''}
-            ${video.cached ? '<span class="video-item-cached">En cache</span>' : ''}
-          </div>
-        </div>
+      const key = video.folder || '_root';
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(video);
+    });
+
+    const sortedKeys = Object.keys(groups).sort((a, b) => {
+      if (a === '_root') return -1;
+      if (b === '_root') return 1;
+      return b.localeCompare(a);
+    });
+
+    sortedKeys.forEach((key, index) => {
+      const isRoot = key === '_root';
+      const videosInGroup = groups[key];
+
+      if (isRoot) {
+        videosInGroup.forEach(video => {
+          videoList.appendChild(createVideoItem(video));
+        });
+        return;
+      }
+
+      const folder = document.createElement('div');
+      folder.className = 'folder-group';
+
+      const header = document.createElement('button');
+      header.className = 'folder-header';
+      const isOpen = index === 0 || (index === 1 && groups['_root']);
+      header.innerHTML = `
+        <svg class="folder-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="9 18 15 12 9 6"/>
+        </svg>
+        <span class="folder-name">${key}</span>
+        <span class="folder-count">${videosInGroup.length}</span>
       `;
-      item.addEventListener('click', () => selectVideo(video));
-      videoList.appendChild(item);
+
+      const content = document.createElement('div');
+      content.className = 'folder-content';
+
+      if (isOpen) {
+        header.classList.add('open');
+        content.style.maxHeight = 'none';
+      }
+
+      header.addEventListener('click', () => {
+        header.classList.toggle('open');
+        if (header.classList.contains('open')) {
+          content.style.maxHeight = content.scrollHeight + 'px';
+          setTimeout(() => content.style.maxHeight = 'none', 250);
+        } else {
+          content.style.maxHeight = content.scrollHeight + 'px';
+          requestAnimationFrame(() => content.style.maxHeight = '0');
+        }
+      });
+
+      videosInGroup.forEach(video => {
+        content.appendChild(createVideoItem(video));
+      });
+
+      folder.appendChild(header);
+      folder.appendChild(content);
+      videoList.appendChild(folder);
     });
   } catch (err) {
     videoList.innerHTML = `<div class="error-state"><h3>Erreur de connexion</h3><p>${err.message}</p></div>`;
@@ -105,24 +165,23 @@ async function loadVideos() {
 
 // --- Video selection & download ---
 async function selectVideo(video) {
-  // Update active state in list
-  document.querySelectorAll('.video-item').forEach(el => el.classList.remove('active'));
-  const items = document.querySelectorAll('.video-item');
-  items.forEach(el => {
-    if (el.querySelector('.video-item-name').textContent === video.name) {
-      el.classList.add('active');
-    }
+  if (currentVideo && currentVideo.id !== video.id) {
+    clearVideoCache(currentVideo.id);
+    currentVideo.cached = false;
+  }
+
+  document.querySelectorAll('.video-item').forEach(el => {
+    const name = el.querySelector('.video-item-name').textContent;
+    el.classList.toggle('active', name === video.name);
   });
 
   currentVideo = video;
 
-  if (video.cached) {
-    // Play directly from cache
+  if (video.hlsReady) {
     startPlayback(video);
     return;
   }
 
-  // Download first
   showState('download');
   downloadTitle.textContent = `Téléchargement : ${video.name}`;
   progressFill.style.width = '0%';
@@ -131,8 +190,8 @@ async function selectVideo(video) {
   try {
     await downloadVideo(video);
     video.cached = true;
+    video.hlsReady = true;
     startPlayback(video);
-    // Refresh list to show cached status
     loadVideos();
   } catch (err) {
     downloadTitle.textContent = 'Erreur de téléchargement';
@@ -180,51 +239,51 @@ function downloadVideo(video) {
 function startPlayback(video) {
   showState('player');
   nowPlayingName.textContent = video.name;
-  loopCount = 0;
-  loopCountEl.textContent = '0';
 
-  // Set video source
-  videoPlayer.src = `/api/play/${video.id}`;
+  const baseUrl = networkBaseUrl || window.location.origin;
+  videoPlayer.src = `${baseUrl}/api/hls/${video.id}/live.m3u8`;
   videoPlayer.load();
 
   const playPromise = videoPlayer.play();
   if (playPromise) {
     playPromise.catch(() => {
-      // Autoplay blocked — user must interact
       playStatus.textContent = 'Cliquez sur la vidéo';
       playStatus.className = 'stat-value status-waiting';
       videoPlayer.addEventListener('click', () => videoPlayer.play(), { once: true });
     });
   }
 
-  // Start timer
   playbackStartTime = Date.now();
   if (timerInterval) clearInterval(timerInterval);
   timerInterval = setInterval(updateTimer, 1000);
 }
 
 function stopPlayback() {
+  const videoToClean = currentVideo;
+
   videoPlayer.pause();
   videoPlayer.removeAttribute('src');
   videoPlayer.load();
 
   currentVideo = null;
-  loopCount = 0;
   playbackStartTime = null;
   if (timerInterval) clearInterval(timerInterval);
 
   document.querySelectorAll('.video-item').forEach(el => el.classList.remove('active'));
   showState('empty');
+
+  if (videoToClean) {
+    clearVideoCache(videoToClean.id);
+    videoToClean.cached = false;
+    loadVideos();
+  }
 }
 
-function handleVideoEnded() {
-  // Fallback: if loop attribute didn't work, manually restart
-  loopCount++;
-  loopCountEl.textContent = loopCount.toString();
-
-  if (videoPlayer.paused) {
-    videoPlayer.currentTime = 0;
-    videoPlayer.play();
+async function clearVideoCache(fileId) {
+  try {
+    await fetch(`/api/cache/${fileId}`, { method: 'DELETE' });
+  } catch {
+    // Non-critical
   }
 }
 
@@ -234,11 +293,8 @@ function handleVideoPlaying() {
 }
 
 function handleVideoPause() {
-  // Don't update status if video is seeking for loop
-  if (videoPlayer.currentTime < videoPlayer.duration - 0.5) {
-    playStatus.textContent = 'En pause';
-    playStatus.className = 'stat-value status-paused';
-  }
+  playStatus.textContent = 'En pause';
+  playStatus.className = 'stat-value status-paused';
 }
 
 function handleVideoError() {
@@ -254,15 +310,6 @@ function handleVideoError() {
     }
   }, 3000);
 }
-
-// Also count loops from the 'seeked' event when loop attribute works
-videoPlayer.addEventListener('seeked', () => {
-  // The loop attribute causes a seek to 0 at the end
-  if (videoPlayer.currentTime === 0 && loopCount >= 0) {
-    loopCount++;
-    loopCountEl.textContent = loopCount.toString();
-  }
-});
 
 function toggleFullscreen() {
   const container = document.querySelector('.video-container');
@@ -308,6 +355,11 @@ function formatFileSize(bytes) {
   if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' Mo';
   return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' Go';
 }
+
+// Clear all cache when leaving the page
+window.addEventListener('beforeunload', () => {
+  navigator.sendBeacon('/api/cache/clear');
+});
 
 // --- Start ---
 init();

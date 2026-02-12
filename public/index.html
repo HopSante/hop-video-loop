@@ -9,24 +9,11 @@
 </head>
 <body>
   <div id="app">
-    <!-- Header -->
     <header>
-      <h1>Hop Video Loop</h1>
-      <p class="subtitle">Diffusion en boucle sur Smart TV via AirPlay</p>
+      <h1><span class="logo-hop">Hop</span> Video Loop</h1>
     </header>
 
-    <!-- Server info banner -->
-    <div id="server-info" class="info-banner hidden">
-      <span class="info-icon">i</span>
-      <div>
-        <strong>Adresse réseau :</strong> <span id="network-url"></span>
-        <br><small>Utilisez cette adresse si AirPlay ne détecte pas la vidéo</small>
-      </div>
-    </div>
-
-    <!-- Main layout -->
     <div class="layout">
-      <!-- Video list panel -->
       <aside id="video-list-panel">
         <div class="panel-header">
           <h2>Vidéos</h2>
@@ -44,9 +31,7 @@
         </div>
       </aside>
 
-      <!-- Player panel -->
       <main id="player-panel">
-        <!-- Empty state -->
         <div id="empty-state" class="empty-state">
           <div class="empty-icon">
             <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -54,10 +39,9 @@
             </svg>
           </div>
           <h3>Sélectionnez une vidéo</h3>
-          <p>Choisissez une vidéo dans la liste pour commencer la diffusion en boucle</p>
+          <p>Choisissez une vidéo dans la liste pour lancer la diffusion</p>
         </div>
 
-        <!-- Download progress -->
         <div id="download-state" class="download-state hidden">
           <div class="download-icon">
             <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -71,16 +55,12 @@
           <p id="download-info" class="download-info">0%</p>
         </div>
 
-        <!-- Video player -->
         <div id="player-state" class="player-state hidden">
           <div class="video-container">
             <video
               id="video-player"
+              controls
               playsinline
-              loop
-              autoplay
-              x-webkit-airplay="allow"
-              airplay="allow"
             ></video>
           </div>
           <div class="player-controls">
@@ -90,11 +70,7 @@
             </div>
             <div class="loop-stats">
               <div class="stat">
-                <span class="stat-label">Boucles</span>
-                <span id="loop-count" class="stat-value">0</span>
-              </div>
-              <div class="stat">
-                <span class="stat-label">Durée totale</span>
+                <span class="stat-label">Durée</span>
                 <span id="total-time" class="stat-value">00:00:00</span>
               </div>
               <div class="stat">
@@ -116,14 +92,6 @@
                 Arrêter
               </button>
             </div>
-          </div>
-          <!-- AirPlay instructions -->
-          <div class="airplay-hint">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-              <path d="M5 17H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-1"/>
-              <polygon points="12 15 17 21 7 21 12 15"/>
-            </svg>
-            <span>Pour diffuser sur TV : cliquez sur l'icône AirPlay dans les contrôles vidéo (Safari) ou utilisez le Cast (Chrome)</span>
           </div>
         </div>
       </main>
