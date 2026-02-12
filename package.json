@@ -1,0 +1,17 @@
+{
+  "name": "hop-video-loop",
+  "version": "1.0.0",
+  "description": "Diffusion en boucle de vidéos Google Drive sur Smart TV via AirPlay",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": ["video", "loop", "airplay", "google-drive", "smart-tv"],
+  "author": "Hop Santé",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2"
+  }
+}
