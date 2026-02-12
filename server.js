@@ -63,7 +63,7 @@ function segmentCount(fileId) {
 }
 
 function hlsReady(fileId) {
-  return !!ffmpegProcesses[fileId] && segmentCount(fileId) >= 5;
+  return !!ffmpegProcesses[fileId] && segmentCount(fileId) >= 3;
 }
 
 // --- ffmpeg live processes ---
@@ -84,10 +84,9 @@ function spawnFfmpeg(fileId, videoPath, reencode = false) {
     '-stream_loop', '-1', '-re', '-i', videoPath,
     ...codecArgs,
     '-f', 'hls',
-    '-hls_time', '4',
-    '-hls_list_size', '150',
-    '-hls_delete_threshold', '50',
-    '-hls_flags', 'delete_segments+append_list+omit_endlist',
+    '-hls_time', '6',
+    '-hls_list_size', '100',
+    '-hls_flags', 'delete_segments',
     '-hls_segment_filename', 'seg_%05d.ts',
     '-y', 'live.m3u8'
   ];
@@ -218,7 +217,7 @@ fetchAllVideos().then(videos => {
 async function waitForSegments(fileId, maxSeconds, send, statusPrefix) {
   for (let i = 0; i < maxSeconds; i++) {
     await new Promise(r => setTimeout(r, 1000));
-    if (segmentCount(fileId) >= 5) return true;
+    if (segmentCount(fileId) >= 3) return true;
     send({ type: 'status', message: `${statusPrefix} ${i + 1}s` });
     if (!ffmpegProcesses[fileId]) return false;
   }
