@@ -3,6 +3,10 @@ let currentVideo = null;
 let playbackStartTime = null;
 let timerInterval = null;
 let networkBaseUrl = '';
+let recoveryAttempts = 0;
+let recoveryTimer = null;
+let playlistPollInterval = null;
+const MAX_RECOVERY_ATTEMPTS = 10;
 
 // --- DOM ---
 const videoList = document.getElementById('video-list');
@@ -35,6 +39,8 @@ async function init() {
   videoPlayer.addEventListener('playing', handleVideoPlaying);
   videoPlayer.addEventListener('pause', handleVideoPause);
   videoPlayer.addEventListener('error', handleVideoError);
+  videoPlayer.addEventListener('stalled', handleVideoStalled);
+  videoPlayer.addEventListener('waiting', handleVideoWaiting);
 }
 
 // --- Server info ---
@@ -236,12 +242,29 @@ function downloadVideo(video) {
 }
 
 // --- Playback ---
+function getStreamUrl(videoId) {
+  const baseUrl = networkBaseUrl || window.location.origin;
+  return `${baseUrl}/api/hls/${videoId}/live.m3u8`;
+}
+
 function startPlayback(video) {
   showState('player');
   nowPlayingName.textContent = video.name;
+  recoveryAttempts = 0;
 
-  const baseUrl = networkBaseUrl || window.location.origin;
-  videoPlayer.src = `${baseUrl}/api/hls/${video.id}/live.m3u8`;
+  loadStream(video.id);
+
+  playbackStartTime = Date.now();
+  if (timerInterval) clearInterval(timerInterval);
+  timerInterval = setInterval(updateTimer, 1000);
+
+  // Poll the playlist periodically to detect server-side issues early
+  startPlaylistPolling(video.id);
+}
+
+function loadStream(videoId) {
+  const url = getStreamUrl(videoId);
+  videoPlayer.src = url;
   videoPlayer.load();
 
   const playPromise = videoPlayer.play();
@@ -252,14 +275,33 @@ function startPlayback(video) {
       videoPlayer.addEventListener('click', () => videoPlayer.play(), { once: true });
     });
   }
+}
 
-  playbackStartTime = Date.now();
-  if (timerInterval) clearInterval(timerInterval);
-  timerInterval = setInterval(updateTimer, 1000);
+function startPlaylistPolling(videoId) {
+  if (playlistPollInterval) clearInterval(playlistPollInterval);
+  playlistPollInterval = setInterval(async () => {
+    if (!currentVideo || currentVideo.id !== videoId) {
+      clearInterval(playlistPollInterval);
+      return;
+    }
+    try {
+      const res = await fetch(getStreamUrl(videoId), { cache: 'no-store' });
+      if (!res.ok) {
+        console.warn('Playlist poll: server returned', res.status);
+        attemptRecovery('Playlist indisponible');
+      }
+    } catch {
+      console.warn('Playlist poll: network error');
+      attemptRecovery('Connexion perdue');
+    }
+  }, 10000);
 }
 
 function stopPlayback() {
   const videoToClean = currentVideo;
+
+  if (recoveryTimer) { clearTimeout(recoveryTimer); recoveryTimer = null; }
+  if (playlistPollInterval) { clearInterval(playlistPollInterval); playlistPollInterval = null; }
 
   videoPlayer.pause();
   videoPlayer.removeAttribute('src');
@@ -267,6 +309,7 @@ function stopPlayback() {
 
   currentVideo = null;
   playbackStartTime = null;
+  recoveryAttempts = 0;
   if (timerInterval) clearInterval(timerInterval);
 
   document.querySelectorAll('.video-item').forEach(el => el.classList.remove('active'));
@@ -290,25 +333,70 @@ async function clearVideoCache(fileId) {
 function handleVideoPlaying() {
   playStatus.textContent = 'En lecture';
   playStatus.className = 'stat-value status-playing';
+  // Reset recovery counter on successful playback
+  recoveryAttempts = 0;
+  if (recoveryTimer) { clearTimeout(recoveryTimer); recoveryTimer = null; }
 }
 
 function handleVideoPause() {
+  // Ignore pause events during recovery
+  if (recoveryTimer) return;
   playStatus.textContent = 'En pause';
   playStatus.className = 'stat-value status-paused';
 }
 
-function handleVideoError() {
-  playStatus.textContent = 'Erreur';
-  playStatus.className = 'stat-value';
-  playStatus.style.color = 'var(--danger)';
+function handleVideoStalled() {
+  if (!currentVideo) return;
+  console.warn('Video stalled — waiting for data...');
+  playStatus.textContent = 'Mise en tampon...';
+  playStatus.className = 'stat-value status-waiting';
 
-  // Try to recover after 3 seconds
-  setTimeout(() => {
-    if (currentVideo) {
-      videoPlayer.load();
-      videoPlayer.play();
-    }
-  }, 3000);
+  // If stalled for more than 8 seconds, attempt recovery
+  if (!recoveryTimer) {
+    recoveryTimer = setTimeout(() => {
+      recoveryTimer = null;
+      if (currentVideo && videoPlayer.readyState < 3) {
+        attemptRecovery('Flux bloqué');
+      }
+    }, 8000);
+  }
+}
+
+function handleVideoWaiting() {
+  if (!currentVideo) return;
+  playStatus.textContent = 'Mise en tampon...';
+  playStatus.className = 'stat-value status-waiting';
+}
+
+function handleVideoError() {
+  if (!currentVideo) return;
+  const err = videoPlayer.error;
+  console.error('Video error:', err?.code, err?.message);
+  attemptRecovery('Erreur de lecture');
+}
+
+function attemptRecovery(reason) {
+  if (!currentVideo) return;
+  if (recoveryTimer) return; // Already recovering
+
+  recoveryAttempts++;
+  if (recoveryAttempts > MAX_RECOVERY_ATTEMPTS) {
+    playStatus.textContent = 'Échec — relancez la vidéo';
+    playStatus.className = 'stat-value';
+    playStatus.style.color = 'var(--danger)';
+    return;
+  }
+
+  const delay = Math.min(2000 * recoveryAttempts, 10000);
+  console.log(`Recovery attempt ${recoveryAttempts}/${MAX_RECOVERY_ATTEMPTS} (${reason}) in ${delay}ms`);
+  playStatus.textContent = `Reconnexion ${recoveryAttempts}/${MAX_RECOVERY_ATTEMPTS}...`;
+  playStatus.className = 'stat-value status-waiting';
+
+  recoveryTimer = setTimeout(() => {
+    recoveryTimer = null;
+    if (!currentVideo) return;
+    loadStream(currentVideo.id);
+  }, delay);
 }
 
 function toggleFullscreen() {

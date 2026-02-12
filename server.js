@@ -11,6 +11,15 @@ const API_KEY = process.env.GOOGLE_API_KEY;
 const FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
 const CACHE_DIR = path.join(__dirname, '.cache');
 
+// --- CORS for AirPlay (Apple TV fetches HLS segments directly) ---
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Range');
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  next();
+});
+
 function clearCacheDir() {
   if (fs.existsSync(CACHE_DIR)) {
     for (const entry of fs.readdirSync(CACHE_DIR)) {
@@ -54,7 +63,7 @@ function segmentCount(fileId) {
 }
 
 function hlsReady(fileId) {
-  return !!ffmpegProcesses[fileId] && segmentCount(fileId) >= 3;
+  return !!ffmpegProcesses[fileId] && segmentCount(fileId) >= 5;
 }
 
 // --- ffmpeg live processes ---
@@ -74,8 +83,11 @@ function spawnFfmpeg(fileId, videoPath, reencode = false) {
   const args = [
     '-stream_loop', '-1', '-re', '-i', videoPath,
     ...codecArgs,
-    '-f', 'hls', '-hls_time', '6', '-hls_list_size', '20',
-    '-hls_flags', 'delete_segments',
+    '-f', 'hls',
+    '-hls_time', '4',
+    '-hls_list_size', '150',
+    '-hls_delete_threshold', '50',
+    '-hls_flags', 'delete_segments+append_list+omit_endlist',
     '-hls_segment_filename', 'seg_%05d.ts',
     '-y', 'live.m3u8'
   ];
@@ -100,6 +112,16 @@ function spawnFfmpeg(fileId, videoPath, reencode = false) {
   proc.on('exit', (code) => {
     console.log(`  ${label} [${fileId}] terminé (code ${code})`);
     delete ffmpegProcesses[fileId];
+
+    // Auto-restart if unexpected exit (not manually stopped)
+    if (code !== 0 && !proc._manuallyStopped) {
+      console.log(`  Redémarrage automatique du flux pour ${fileId}...`);
+      setTimeout(() => {
+        if (!ffmpegProcesses[fileId] && fs.existsSync(videoPath)) {
+          spawnFfmpeg(fileId, videoPath, reencode);
+        }
+      }, 2000);
+    }
   });
 
   return proc;
@@ -108,6 +130,7 @@ function spawnFfmpeg(fileId, videoPath, reencode = false) {
 function stopFfmpegLive(fileId) {
   const proc = ffmpegProcesses[fileId];
   if (proc) {
+    proc._manuallyStopped = true;
     try { proc.kill('SIGTERM'); } catch {}
     delete ffmpegProcesses[fileId];
   }
@@ -195,7 +218,7 @@ fetchAllVideos().then(videos => {
 async function waitForSegments(fileId, maxSeconds, send, statusPrefix) {
   for (let i = 0; i < maxSeconds; i++) {
     await new Promise(r => setTimeout(r, 1000));
-    if (segmentCount(fileId) >= 3) return true;
+    if (segmentCount(fileId) >= 5) return true;
     send({ type: 'status', message: `${statusPrefix} ${i + 1}s` });
     if (!ffmpegProcesses[fileId]) return false;
   }
@@ -293,9 +316,13 @@ app.get('/api/hls/:fileId/live.m3u8', (req, res) => {
   const m3u8Path = path.join(getHlsDir(req.params.fileId), 'live.m3u8');
   if (!fs.existsSync(m3u8Path)) return res.status(404).json({ error: 'Stream non prêt' });
 
+  const content = fs.readFileSync(m3u8Path, 'utf8');
   res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-  res.setHeader('Cache-Control', 'no-cache, no-store');
-  res.send(fs.readFileSync(m3u8Path, 'utf8'));
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('Connection', 'keep-alive');
+  res.send(content);
 });
 
 app.get('/api/hls/:fileId/:segFile', (req, res) => {
@@ -305,8 +332,11 @@ app.get('/api/hls/:fileId/:segFile', (req, res) => {
   const segPath = path.join(getHlsDir(fileId), segFile);
   if (!fs.existsSync(segPath)) return res.status(404).end();
 
+  const stat = fs.statSync(segPath);
   res.setHeader('Content-Type', 'video/MP2T');
-  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Content-Length', stat.size);
+  res.setHeader('Cache-Control', 'max-age=60');
+  res.setHeader('Connection', 'keep-alive');
   fs.createReadStream(segPath).pipe(res);
 });
 
@@ -360,7 +390,7 @@ app.delete('/api/cache', handleClearCache);
 process.on('SIGTERM', () => { stopAllFfmpeg(); process.exit(0); });
 process.on('SIGINT', () => { stopAllFfmpeg(); process.exit(0); });
 
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   const ip = getLocalIp();
   console.log('');
   console.log('  ╔══════════════════════════════════════════════╗');
@@ -372,4 +402,8 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('  ║  ffmpeg live — boucle infinie — AirPlay OK   ║');
   console.log('  ╚══════════════════════════════════════════════╝');
   console.log('');
+
+  // Keep-alive for AirPlay connections
+  server.keepAliveTimeout = 120000;
+  server.headersTimeout = 125000;
 });
