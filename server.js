@@ -32,6 +32,29 @@ function clearCacheDir() {
 try { clearCacheDir(); } catch {}
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
+// Redirect localhost to network IP (AirPlay sends video URL to Apple TV,
+// which can't reach "localhost" — it needs the real network IP)
+app.use((req, res, next) => {
+  const host = req.hostname;
+  if (host === 'localhost' || host === '127.0.0.1') {
+    const ip = getLocalIp();
+    if (ip !== 'localhost') {
+      return res.redirect(301, `http://${ip}:${PORT}${req.originalUrl}`);
+    }
+  }
+  next();
+});
+
+// Request logging
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/')) {
+    const ua = req.headers['user-agent'] || '';
+    const from = req.ip || req.connection.remoteAddress;
+    console.log(`  [${new Date().toLocaleTimeString()}] ${req.method} ${req.path} — from ${from} — UA: ${ua.substring(0, 60)}`);
+  }
+  next();
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 
 // --- Helpers ---

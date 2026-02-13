@@ -2,7 +2,6 @@
 let currentVideo = null;
 let playbackStartTime = null;
 let timerInterval = null;
-let networkBaseUrl = '';
 let loopCheckInterval = null;
 let loopCount = 0;
 
@@ -28,7 +27,6 @@ const stopBtn = document.getElementById('stop-btn');
 
 // --- Init ---
 async function init() {
-  loadServerInfo();
   loadVideos();
 
   refreshBtn.addEventListener('click', () => loadVideos(true));
@@ -39,17 +37,6 @@ async function init() {
   videoPlayer.addEventListener('pause', handleVideoPause);
   videoPlayer.addEventListener('ended', handleVideoEnded);
   videoPlayer.addEventListener('error', handleVideoError);
-}
-
-// --- Server info ---
-async function loadServerInfo() {
-  try {
-    const res = await fetch('/api/info');
-    const info = await res.json();
-    networkBaseUrl = `http://${info.ip}:${info.port}`;
-  } catch {
-    // Non-critical
-  }
 }
 
 // --- Video list ---
@@ -242,9 +229,9 @@ function downloadVideo(video) {
 // --- Playback (VOD HLS + loop) ---
 
 function getPlaylistUrl(videoId) {
-  // Use network IP so Apple TV can reach the server directly via AirPlay
-  const baseUrl = networkBaseUrl || window.location.origin;
-  return `${baseUrl}/api/hls/${videoId}/playlist.m3u8`;
+  // Relative URL — page is already on the network IP (redirected from localhost)
+  // so AirPlay sends the correct IP-based URL to the Apple TV
+  return `/api/hls/${videoId}/playlist.m3u8`;
 }
 
 function startPlayback(video) {
@@ -301,10 +288,18 @@ function restartForLoop() {
   if (!currentVideo) return;
   loopCount++;
   updateLoopCount();
-  console.log(`Boucle #${loopCount} — rechargement du flux`);
+  console.log(`Boucle #${loopCount} — redémarrage`);
 
-  // Reload the entire source (most reliable for AirPlay)
-  loadAndPlay(currentVideo.id);
+  // Seamless seek to start (no black flash — works on local + AirPlay first loops)
+  videoPlayer.currentTime = 0;
+  const playPromise = videoPlayer.play();
+  if (playPromise) {
+    playPromise.catch(() => {
+      // Fallback: full src reload (causes brief flash but always works)
+      console.log('Seek failed, fallback to full reload');
+      loadAndPlay(currentVideo.id);
+    });
+  }
 }
 
 function stopPlayback() {
