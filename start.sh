@@ -30,6 +30,9 @@ fi
 # 4. Installer les dependances
 npm install
 
-# 5. Lancer l'app
+# 5. Arreter l'ancien serveur si actif
+lsof -ti:3000 | xargs kill -9 2>/dev/null
+
+# 6. Lancer l'app
 echo "🚀 Lancement de Hop Video Loop..."
 npm start & sleep 3 && open -a Safari http://localhost:3000
