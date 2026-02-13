@@ -11,11 +11,12 @@ const API_KEY = process.env.GOOGLE_API_KEY;
 const FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
 const CACHE_DIR = path.join(__dirname, '.cache');
 
-// --- CORS for AirPlay (Apple TV fetches HLS segments directly) ---
+// --- CORS (Apple TV fetches HLS segments directly via AirPlay) ---
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Range');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range');
   if (req.method === 'OPTIONS') return res.status(204).end();
   next();
 });
@@ -55,18 +56,26 @@ function getHlsDir(fileId) {
   return path.join(CACHE_DIR, `${fileId}_hls`);
 }
 
+function getPlaylistPath(fileId) {
+  return path.join(getHlsDir(fileId), 'playlist.m3u8');
+}
+
 function segmentCount(fileId) {
-  const m3u8Path = path.join(getHlsDir(fileId), 'live.m3u8');
+  const m3u8Path = getPlaylistPath(fileId);
   if (!fs.existsSync(m3u8Path)) return 0;
   const content = fs.readFileSync(m3u8Path, 'utf8');
   return (content.match(/#EXTINF/g) || []).length;
 }
 
+// VOD ready = playlist exists and contains #EXT-X-ENDLIST (ffmpeg finished)
 function hlsReady(fileId) {
-  return !!ffmpegProcesses[fileId] && segmentCount(fileId) >= 3;
+  const m3u8Path = getPlaylistPath(fileId);
+  if (!fs.existsSync(m3u8Path)) return false;
+  const content = fs.readFileSync(m3u8Path, 'utf8');
+  return content.includes('#EXT-X-ENDLIST');
 }
 
-// --- ffmpeg live processes ---
+// --- ffmpeg processes ---
 const ffmpegProcesses = {};
 
 function spawnFfmpeg(fileId, videoPath, reencode = false) {
@@ -76,23 +85,28 @@ function spawnFfmpeg(fileId, videoPath, reencode = false) {
   }
   fs.mkdirSync(hlsDir, { recursive: true });
 
+  // VOD HLS: segment once, no real-time constraint, no loop
+  // Apple AirPlay best practices: Main profile, level 4.0, yuv420p, AAC-LC
   const codecArgs = reencode
-    ? ['-c:v', 'libx264', '-profile:v', 'high', '-preset', 'ultrafast', '-c:a', 'aac', '-b:a', '192k']
+    ? ['-c:v', 'libx264', '-profile:v', 'main', '-level', '4.0', '-pix_fmt', 'yuv420p',
+       '-preset', 'fast', '-crf', '23', '-sc_threshold', '0',
+       '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2']
     : ['-c', 'copy'];
 
   const args = [
-    '-stream_loop', '-1', '-re', '-i', videoPath,
+    '-i', videoPath,
     ...codecArgs,
     '-f', 'hls',
     '-hls_time', '6',
-    '-hls_list_size', '100',
-    '-hls_flags', 'delete_segments',
+    '-hls_list_size', '0',
+    '-hls_playlist_type', 'vod',
+    '-hls_segment_type', 'mpegts',
     '-hls_segment_filename', 'seg_%05d.ts',
-    '-y', 'live.m3u8'
+    '-y', 'playlist.m3u8'
   ];
 
-  const label = reencode ? 'ffmpeg re-encode' : 'ffmpeg live';
-  console.log(`  ${label} demarré pour ${fileId}`);
+  const label = reencode ? 'ffmpeg VOD re-encode' : 'ffmpeg VOD segment';
+  console.log(`  ${label} démarré pour ${fileId}`);
 
   const proc = spawn('ffmpeg', args, {
     cwd: hlsDir,
@@ -111,32 +125,21 @@ function spawnFfmpeg(fileId, videoPath, reencode = false) {
   proc.on('exit', (code) => {
     console.log(`  ${label} [${fileId}] terminé (code ${code})`);
     delete ffmpegProcesses[fileId];
-
-    // Auto-restart if unexpected exit (not manually stopped)
-    if (code !== 0 && !proc._manuallyStopped) {
-      console.log(`  Redémarrage automatique du flux pour ${fileId}...`);
-      setTimeout(() => {
-        if (!ffmpegProcesses[fileId] && fs.existsSync(videoPath)) {
-          spawnFfmpeg(fileId, videoPath, reencode);
-        }
-      }, 2000);
-    }
   });
 
   return proc;
 }
 
-function stopFfmpegLive(fileId) {
+function stopFfmpeg(fileId) {
   const proc = ffmpegProcesses[fileId];
   if (proc) {
-    proc._manuallyStopped = true;
     try { proc.kill('SIGTERM'); } catch {}
     delete ffmpegProcesses[fileId];
   }
 }
 
 function stopAllFfmpeg() {
-  Object.keys(ffmpegProcesses).forEach(id => stopFfmpegLive(id));
+  Object.keys(ffmpegProcesses).forEach(id => stopFfmpeg(id));
 }
 
 // --- Video list cache ---
@@ -214,12 +217,15 @@ fetchAllVideos().then(videos => {
   console.log(`  Liste pré-chargée : ${videoListCache.length} vidéos`);
 }).catch(() => {});
 
-async function waitForSegments(fileId, maxSeconds, send, statusPrefix) {
+// Wait for ffmpeg VOD segmentation to complete (#EXT-X-ENDLIST present)
+async function waitForVodReady(fileId, maxSeconds, send, statusPrefix) {
   for (let i = 0; i < maxSeconds; i++) {
     await new Promise(r => setTimeout(r, 1000));
-    if (segmentCount(fileId) >= 3) return true;
-    send({ type: 'status', message: `${statusPrefix} ${i + 1}s` });
-    if (!ffmpegProcesses[fileId]) return false;
+    if (hlsReady(fileId)) return true;
+    const count = segmentCount(fileId);
+    send({ type: 'status', message: `${statusPrefix} (${count} segments, ${i + 1}s)` });
+    // ffmpeg exited — check one last time
+    if (!ffmpegProcesses[fileId]) return hlsReady(fileId);
   }
   return false;
 }
@@ -283,25 +289,26 @@ app.get('/api/download/:fileId', async (req, res) => {
       });
     }
 
-    send({ type: 'status', message: 'Démarrage du flux live...' });
-    stopFfmpegLive(fileId);
+    // Segment as VOD HLS (fast, no real-time constraint)
+    send({ type: 'status', message: 'Préparation des segments vidéo...' });
+    stopFfmpeg(fileId);
     spawnFfmpeg(fileId, cachedPath);
 
-    let ready = await waitForSegments(fileId, 30, send, 'Préparation du flux...');
+    let ready = await waitForVodReady(fileId, 120, send, 'Segmentation en cours...');
 
     if (!ready && !ffmpegProcesses[fileId]) {
-      send({ type: 'error', message: 'Erreur ffmpeg — tentative avec ré-encodage...' });
+      send({ type: 'status', message: 'Ré-encodage pour compatibilité AirPlay...' });
       spawnFfmpeg(fileId, cachedPath, true);
-      ready = await waitForSegments(fileId, 60, send, 'Ré-encodage...');
+      ready = await waitForVodReady(fileId, 300, send, 'Ré-encodage...');
     }
 
     if (!ready) {
-      stopFfmpegLive(fileId);
-      send({ type: 'error', message: 'Impossible de démarrer le flux' });
+      stopFfmpeg(fileId);
+      send({ type: 'error', message: 'Impossible de préparer la vidéo' });
       return res.end();
     }
 
-    console.log(`  Flux live prêt pour ${fileId}`);
+    console.log(`  VOD HLS prêt pour ${fileId} (${segmentCount(fileId)} segments)`);
     send({ type: 'complete', message: 'Prêt' });
     res.end();
   } catch (err) {
@@ -311,15 +318,16 @@ app.get('/api/download/:fileId', async (req, res) => {
   }
 });
 
-app.get('/api/hls/:fileId/live.m3u8', (req, res) => {
-  const m3u8Path = path.join(getHlsDir(req.params.fileId), 'live.m3u8');
-  if (!fs.existsSync(m3u8Path)) return res.status(404).json({ error: 'Stream non prêt' });
+// --- HLS serving (static VOD segments) ---
+
+app.get('/api/hls/:fileId/playlist.m3u8', (req, res) => {
+  const m3u8Path = getPlaylistPath(req.params.fileId);
+  if (!fs.existsSync(m3u8Path)) return res.status(404).json({ error: 'Vidéo non prête' });
 
   const content = fs.readFileSync(m3u8Path, 'utf8');
   res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
+  // VOD playlist is static — cache it but allow refresh
+  res.setHeader('Cache-Control', 'public, max-age=3600');
   res.setHeader('Connection', 'keep-alive');
   res.send(content);
 });
@@ -334,7 +342,9 @@ app.get('/api/hls/:fileId/:segFile', (req, res) => {
   const stat = fs.statSync(segPath);
   res.setHeader('Content-Type', 'video/MP2T');
   res.setHeader('Content-Length', stat.size);
-  res.setHeader('Cache-Control', 'max-age=60');
+  // VOD segments never change — cache aggressively
+  res.setHeader('Cache-Control', 'public, max-age=86400');
+  res.setHeader('Accept-Ranges', 'bytes');
   res.setHeader('Connection', 'keep-alive');
   fs.createReadStream(segPath).pipe(res);
 });
@@ -368,7 +378,7 @@ app.get('/api/play/:fileId', (req, res) => {
 
 app.delete('/api/cache/:fileId', (req, res) => {
   const fileId = req.params.fileId;
-  stopFfmpegLive(fileId);
+  stopFfmpeg(fileId);
   const filePath = getCachedFile(fileId);
   const metaPath = path.join(CACHE_DIR, `${fileId}.json`);
   const hlsDir = getHlsDir(fileId);
@@ -398,7 +408,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`  ║  Local:   http://localhost:${PORT}              ║`);
   console.log(`  ║  Réseau:  http://${ip}:${PORT}        ║`);
   console.log('  ╠══════════════════════════════════════════════╣');
-  console.log('  ║  ffmpeg live — boucle infinie — AirPlay OK   ║');
+  console.log('  ║  VOD HLS — AirPlay optimisé — boucle auto   ║');
   console.log('  ╚══════════════════════════════════════════════╝');
   console.log('');
 

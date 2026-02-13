@@ -61,6 +61,7 @@
               id="video-player"
               controls
               playsinline
+              x-webkit-airplay="allow"
             ></video>
           </div>
           <div class="player-controls">
@@ -70,8 +71,12 @@
             </div>
             <div class="loop-stats">
               <div class="stat">
-                <span class="stat-label">Durée</span>
+                <span class="stat-label">Durée totale</span>
                 <span id="total-time" class="stat-value">00:00:00</span>
+              </div>
+              <div class="stat">
+                <span class="stat-label">Boucles</span>
+                <span id="loop-count" class="stat-value">0</span>
               </div>
               <div class="stat">
                 <span class="stat-label">Statut</span>

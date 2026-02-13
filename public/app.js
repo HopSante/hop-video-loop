@@ -3,10 +3,8 @@ let currentVideo = null;
 let playbackStartTime = null;
 let timerInterval = null;
 let networkBaseUrl = '';
-let recoveryAttempts = 0;
-let recoveryTimer = null;
-let playlistPollInterval = null;
-const MAX_RECOVERY_ATTEMPTS = 10;
+let loopCheckInterval = null;
+let loopCount = 0;
 
 // --- DOM ---
 const videoList = document.getElementById('video-list');
@@ -24,6 +22,7 @@ const videoPlayer = document.getElementById('video-player');
 const nowPlayingName = document.getElementById('now-playing-name');
 const totalTimeEl = document.getElementById('total-time');
 const playStatus = document.getElementById('play-status');
+const loopCountEl = document.getElementById('loop-count');
 const fullscreenBtn = document.getElementById('fullscreen-btn');
 const stopBtn = document.getElementById('stop-btn');
 
@@ -38,9 +37,8 @@ async function init() {
 
   videoPlayer.addEventListener('playing', handleVideoPlaying);
   videoPlayer.addEventListener('pause', handleVideoPause);
+  videoPlayer.addEventListener('ended', handleVideoEnded);
   videoPlayer.addEventListener('error', handleVideoError);
-  videoPlayer.addEventListener('stalled', handleVideoStalled);
-  videoPlayer.addEventListener('waiting', handleVideoWaiting);
 }
 
 // --- Server info ---
@@ -241,29 +239,32 @@ function downloadVideo(video) {
   });
 }
 
-// --- Playback ---
-function getStreamUrl(videoId) {
+// --- Playback (VOD HLS + loop) ---
+
+function getPlaylistUrl(videoId) {
+  // Use network IP so Apple TV can reach the server directly via AirPlay
   const baseUrl = networkBaseUrl || window.location.origin;
-  return `${baseUrl}/api/hls/${videoId}/live.m3u8`;
+  return `${baseUrl}/api/hls/${videoId}/playlist.m3u8`;
 }
 
 function startPlayback(video) {
   showState('player');
   nowPlayingName.textContent = video.name;
-  recoveryAttempts = 0;
+  loopCount = 0;
+  updateLoopCount();
 
-  loadStream(video.id);
+  loadAndPlay(video.id);
 
   playbackStartTime = Date.now();
   if (timerInterval) clearInterval(timerInterval);
   timerInterval = setInterval(updateTimer, 1000);
 
-  // Poll the playlist periodically to detect server-side issues early
-  startPlaylistPolling(video.id);
+  // Polling safety net: detect video end even if 'ended' event doesn't fire (AirPlay issue)
+  startLoopMonitoring();
 }
 
-function loadStream(videoId) {
-  const url = getStreamUrl(videoId);
+function loadAndPlay(videoId) {
+  const url = getPlaylistUrl(videoId);
   videoPlayer.src = url;
   videoPlayer.load();
 
@@ -277,31 +278,39 @@ function loadStream(videoId) {
   }
 }
 
-function startPlaylistPolling(videoId) {
-  if (playlistPollInterval) clearInterval(playlistPollInterval);
-  playlistPollInterval = setInterval(async () => {
-    if (!currentVideo || currentVideo.id !== videoId) {
-      clearInterval(playlistPollInterval);
-      return;
+// Polling every second to detect video end — critical for AirPlay
+// because the 'ended' event stops firing after the first loop on AirPlay
+function startLoopMonitoring() {
+  if (loopCheckInterval) clearInterval(loopCheckInterval);
+  loopCheckInterval = setInterval(() => {
+    if (!currentVideo) return;
+
+    const isEnded = videoPlayer.ended;
+    const isNearEnd = videoPlayer.duration > 0
+      && (videoPlayer.duration - videoPlayer.currentTime) < 0.5
+      && videoPlayer.paused;
+
+    if (isEnded || isNearEnd) {
+      console.log(`Loop detected (ended=${isEnded}, nearEnd=${isNearEnd}) — restarting`);
+      restartForLoop();
     }
-    try {
-      const res = await fetch(getStreamUrl(videoId), { cache: 'no-store' });
-      if (!res.ok) {
-        console.warn('Playlist poll: server returned', res.status);
-        attemptRecovery('Playlist indisponible');
-      }
-    } catch {
-      console.warn('Playlist poll: network error');
-      attemptRecovery('Connexion perdue');
-    }
-  }, 10000);
+  }, 1000);
+}
+
+function restartForLoop() {
+  if (!currentVideo) return;
+  loopCount++;
+  updateLoopCount();
+  console.log(`Boucle #${loopCount} — rechargement du flux`);
+
+  // Reload the entire source (most reliable for AirPlay)
+  loadAndPlay(currentVideo.id);
 }
 
 function stopPlayback() {
   const videoToClean = currentVideo;
 
-  if (recoveryTimer) { clearTimeout(recoveryTimer); recoveryTimer = null; }
-  if (playlistPollInterval) { clearInterval(playlistPollInterval); playlistPollInterval = null; }
+  if (loopCheckInterval) { clearInterval(loopCheckInterval); loopCheckInterval = null; }
 
   videoPlayer.pause();
   videoPlayer.removeAttribute('src');
@@ -309,7 +318,7 @@ function stopPlayback() {
 
   currentVideo = null;
   playbackStartTime = null;
-  recoveryAttempts = 0;
+  loopCount = 0;
   if (timerInterval) clearInterval(timerInterval);
 
   document.querySelectorAll('.video-item').forEach(el => el.classList.remove('active'));
@@ -333,70 +342,35 @@ async function clearVideoCache(fileId) {
 function handleVideoPlaying() {
   playStatus.textContent = 'En lecture';
   playStatus.className = 'stat-value status-playing';
-  // Reset recovery counter on successful playback
-  recoveryAttempts = 0;
-  if (recoveryTimer) { clearTimeout(recoveryTimer); recoveryTimer = null; }
 }
 
 function handleVideoPause() {
-  // Ignore pause events during recovery
-  if (recoveryTimer) return;
+  // Don't show "En pause" if video ended (loop will restart it)
+  if (videoPlayer.ended) return;
   playStatus.textContent = 'En pause';
   playStatus.className = 'stat-value status-paused';
 }
 
-function handleVideoStalled() {
+function handleVideoEnded() {
+  // 'ended' event fires on first loop — use it as primary trigger
   if (!currentVideo) return;
-  console.warn('Video stalled — waiting for data...');
-  playStatus.textContent = 'Mise en tampon...';
-  playStatus.className = 'stat-value status-waiting';
-
-  // If stalled for more than 8 seconds, attempt recovery
-  if (!recoveryTimer) {
-    recoveryTimer = setTimeout(() => {
-      recoveryTimer = null;
-      if (currentVideo && videoPlayer.readyState < 3) {
-        attemptRecovery('Flux bloqué');
-      }
-    }, 8000);
-  }
-}
-
-function handleVideoWaiting() {
-  if (!currentVideo) return;
-  playStatus.textContent = 'Mise en tampon...';
-  playStatus.className = 'stat-value status-waiting';
+  console.log('Video ended event fired — restarting for loop');
+  restartForLoop();
 }
 
 function handleVideoError() {
   if (!currentVideo) return;
   const err = videoPlayer.error;
   console.error('Video error:', err?.code, err?.message);
-  attemptRecovery('Erreur de lecture');
-}
-
-function attemptRecovery(reason) {
-  if (!currentVideo) return;
-  if (recoveryTimer) return; // Already recovering
-
-  recoveryAttempts++;
-  if (recoveryAttempts > MAX_RECOVERY_ATTEMPTS) {
-    playStatus.textContent = 'Échec — relancez la vidéo';
-    playStatus.className = 'stat-value';
-    playStatus.style.color = 'var(--danger)';
-    return;
-  }
-
-  const delay = Math.min(2000 * recoveryAttempts, 10000);
-  console.log(`Recovery attempt ${recoveryAttempts}/${MAX_RECOVERY_ATTEMPTS} (${reason}) in ${delay}ms`);
-  playStatus.textContent = `Reconnexion ${recoveryAttempts}/${MAX_RECOVERY_ATTEMPTS}...`;
+  playStatus.textContent = 'Erreur — nouvelle tentative...';
   playStatus.className = 'stat-value status-waiting';
 
-  recoveryTimer = setTimeout(() => {
-    recoveryTimer = null;
-    if (!currentVideo) return;
-    loadStream(currentVideo.id);
-  }, delay);
+  // For VOD HLS, a simple reload usually fixes transient errors
+  setTimeout(() => {
+    if (currentVideo) {
+      loadAndPlay(currentVideo.id);
+    }
+  }, 3000);
 }
 
 function toggleFullscreen() {
@@ -421,6 +395,12 @@ function updateTimer() {
   if (!playbackStartTime) return;
   const elapsed = Math.floor((Date.now() - playbackStartTime) / 1000);
   totalTimeEl.textContent = formatTime(elapsed);
+}
+
+function updateLoopCount() {
+  if (loopCountEl) {
+    loopCountEl.textContent = loopCount;
+  }
 }
 
 function formatTime(seconds) {
