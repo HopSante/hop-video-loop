@@ -10,6 +10,7 @@ const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.GOOGLE_API_KEY;
 const FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
 const CACHE_DIR = path.join(__dirname, '.cache');
+const TARGET_LOOP_HOURS = 6;
 
 // --- CORS (Apple TV fetches HLS segments directly via AirPlay) ---
 app.use((req, res, next) => {
@@ -83,19 +84,93 @@ function getPlaylistPath(fileId) {
   return path.join(getHlsDir(fileId), 'playlist.m3u8');
 }
 
+function getOriginalPlaylistPath(fileId) {
+  return path.join(getHlsDir(fileId), 'original.m3u8');
+}
+
 function segmentCount(fileId) {
-  const m3u8Path = getPlaylistPath(fileId);
+  const m3u8Path = getOriginalPlaylistPath(fileId);
   if (!fs.existsSync(m3u8Path)) return 0;
   const content = fs.readFileSync(m3u8Path, 'utf8');
   return (content.match(/#EXTINF/g) || []).length;
 }
 
-// VOD ready = playlist exists and contains #EXT-X-ENDLIST (ffmpeg finished)
+// ffmpeg finished = original playlist has #EXT-X-ENDLIST
+function ffmpegDone(fileId) {
+  const m3u8Path = getOriginalPlaylistPath(fileId);
+  if (!fs.existsSync(m3u8Path)) return false;
+  const content = fs.readFileSync(m3u8Path, 'utf8');
+  return content.includes('#EXT-X-ENDLIST');
+}
+
+// Final looped playlist ready to serve
 function hlsReady(fileId) {
   const m3u8Path = getPlaylistPath(fileId);
   if (!fs.existsSync(m3u8Path)) return false;
   const content = fs.readFileSync(m3u8Path, 'utf8');
   return content.includes('#EXT-X-ENDLIST');
+}
+
+// Create a looped playlist that references the same segments N times
+// so the Apple TV sees a single 6h+ video (no JS loop needed)
+function createLoopedPlaylist(fileId) {
+  const originalPath = getOriginalPlaylistPath(fileId);
+  const playlistPath = getPlaylistPath(fileId);
+
+  const content = fs.readFileSync(originalPath, 'utf8');
+  const lines = content.split('\n');
+
+  // Parse header and segment entries from original playlist
+  const headerLines = [];
+  const segmentEntries = []; // [extinf_line, filename_line]
+  let totalDuration = 0;
+  let inHeader = true;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    if (line === '#EXT-X-ENDLIST') continue;
+    if (line.startsWith('#EXT-X-PLAYLIST-TYPE')) continue;
+
+    if (line.startsWith('#EXTINF:')) {
+      inHeader = false;
+      const duration = parseFloat(line.split(':')[1].split(',')[0]);
+      totalDuration += duration;
+      const filename = (lines[i + 1] || '').trim();
+      segmentEntries.push([line, filename]);
+      i++;
+    } else if (inHeader) {
+      headerLines.push(line);
+    }
+  }
+
+  if (segmentEntries.length === 0 || totalDuration === 0) {
+    console.error('  Erreur : playlist originale vide');
+    return false;
+  }
+
+  const targetSeconds = TARGET_LOOP_HOURS * 3600;
+  const repetitions = Math.max(1, Math.ceil(targetSeconds / totalDuration));
+  const totalMinutes = Math.round(totalDuration * repetitions / 60);
+
+  console.log(`  Playlist bouclée : ${segmentEntries.length} segments × ${repetitions} rép. = ~${totalMinutes} min`);
+
+  // Build looped playlist
+  let playlist = headerLines.join('\n') + '\n';
+  playlist += '#EXT-X-PLAYLIST-TYPE:VOD\n';
+
+  for (let r = 0; r < repetitions; r++) {
+    if (r > 0) {
+      playlist += '#EXT-X-DISCONTINUITY\n';
+    }
+    for (const [extinf, filename] of segmentEntries) {
+      playlist += extinf + '\n' + filename + '\n';
+    }
+  }
+
+  playlist += '#EXT-X-ENDLIST\n';
+  fs.writeFileSync(playlistPath, playlist);
+  return true;
 }
 
 // --- ffmpeg processes ---
@@ -125,7 +200,7 @@ function spawnFfmpeg(fileId, videoPath, reencode = false) {
     '-hls_playlist_type', 'vod',
     '-hls_segment_type', 'mpegts',
     '-hls_segment_filename', 'seg_%05d.ts',
-    '-y', 'playlist.m3u8'
+    '-y', 'original.m3u8'
   ];
 
   const label = reencode ? 'ffmpeg VOD re-encode' : 'ffmpeg VOD segment';
@@ -240,15 +315,14 @@ fetchAllVideos().then(videos => {
   console.log(`  Liste pré-chargée : ${videoListCache.length} vidéos`);
 }).catch(() => {});
 
-// Wait for ffmpeg VOD segmentation to complete (#EXT-X-ENDLIST present)
-async function waitForVodReady(fileId, maxSeconds, send, statusPrefix) {
+// Wait for ffmpeg to finish segmenting (original.m3u8 has #EXT-X-ENDLIST)
+async function waitForFfmpegDone(fileId, maxSeconds, send, statusPrefix) {
   for (let i = 0; i < maxSeconds; i++) {
     await new Promise(r => setTimeout(r, 1000));
-    if (hlsReady(fileId)) return true;
+    if (ffmpegDone(fileId)) return true;
     const count = segmentCount(fileId);
     send({ type: 'status', message: `${statusPrefix} (${count} segments, ${i + 1}s)` });
-    // ffmpeg exited — check one last time
-    if (!ffmpegProcesses[fileId]) return hlsReady(fileId);
+    if (!ffmpegProcesses[fileId]) return ffmpegDone(fileId);
   }
   return false;
 }
@@ -312,17 +386,17 @@ app.get('/api/download/:fileId', async (req, res) => {
       });
     }
 
-    // Segment as VOD HLS (fast, no real-time constraint)
+    // Step 1: Segment video into HLS (fast, -c copy)
     send({ type: 'status', message: 'Préparation des segments vidéo...' });
     stopFfmpeg(fileId);
     spawnFfmpeg(fileId, cachedPath);
 
-    let ready = await waitForVodReady(fileId, 120, send, 'Segmentation en cours...');
+    let ready = await waitForFfmpegDone(fileId, 120, send, 'Segmentation en cours...');
 
     if (!ready && !ffmpegProcesses[fileId]) {
       send({ type: 'status', message: 'Ré-encodage pour compatibilité AirPlay...' });
       spawnFfmpeg(fileId, cachedPath, true);
-      ready = await waitForVodReady(fileId, 300, send, 'Ré-encodage...');
+      ready = await waitForFfmpegDone(fileId, 300, send, 'Ré-encodage...');
     }
 
     if (!ready) {
@@ -331,7 +405,15 @@ app.get('/api/download/:fileId', async (req, res) => {
       return res.end();
     }
 
-    console.log(`  VOD HLS prêt pour ${fileId} (${segmentCount(fileId)} segments)`);
+    // Step 2: Create looped playlist (same segments × N for 6h+)
+    send({ type: 'status', message: `Création de la boucle ${TARGET_LOOP_HOURS}h...` });
+    const looped = createLoopedPlaylist(fileId);
+    if (!looped) {
+      send({ type: 'error', message: 'Erreur création playlist bouclée' });
+      return res.end();
+    }
+
+    console.log(`  VOD HLS bouclé prêt pour ${fileId}`);
     send({ type: 'complete', message: 'Prêt' });
     res.end();
   } catch (err) {

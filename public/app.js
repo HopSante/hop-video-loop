@@ -2,8 +2,6 @@
 let currentVideo = null;
 let playbackStartTime = null;
 let timerInterval = null;
-let loopCheckInterval = null;
-let loopCount = 0;
 
 // --- DOM ---
 const videoList = document.getElementById('video-list');
@@ -21,7 +19,6 @@ const videoPlayer = document.getElementById('video-player');
 const nowPlayingName = document.getElementById('now-playing-name');
 const totalTimeEl = document.getElementById('total-time');
 const playStatus = document.getElementById('play-status');
-const loopCountEl = document.getElementById('loop-count');
 const fullscreenBtn = document.getElementById('fullscreen-btn');
 const stopBtn = document.getElementById('stop-btn');
 
@@ -35,7 +32,6 @@ async function init() {
 
   videoPlayer.addEventListener('playing', handleVideoPlaying);
   videoPlayer.addEventListener('pause', handleVideoPause);
-  videoPlayer.addEventListener('ended', handleVideoEnded);
   videoPlayer.addEventListener('error', handleVideoError);
 }
 
@@ -174,7 +170,7 @@ async function selectVideo(video) {
   }
 
   showState('download');
-  downloadTitle.textContent = `Téléchargement : ${video.name}`;
+  downloadTitle.textContent = `Préparation : ${video.name}`;
   progressFill.style.width = '0%';
   downloadInfo.textContent = 'Démarrage...';
 
@@ -185,7 +181,7 @@ async function selectVideo(video) {
     startPlayback(video);
     loadVideos();
   } catch (err) {
-    downloadTitle.textContent = 'Erreur de téléchargement';
+    downloadTitle.textContent = 'Erreur';
     downloadInfo.textContent = err.message;
   }
 }
@@ -226,33 +222,15 @@ function downloadVideo(video) {
   });
 }
 
-// --- Playback (VOD HLS + loop) ---
-
-function getPlaylistUrl(videoId) {
-  // Relative URL — page is already on the network IP (redirected from localhost)
-  // so AirPlay sends the correct IP-based URL to the Apple TV
-  return `/api/hls/${videoId}/playlist.m3u8`;
-}
+// --- Playback (VOD HLS — 6h looped playlist, no JS loop needed) ---
 
 function startPlayback(video) {
   showState('player');
   nowPlayingName.textContent = video.name;
-  loopCount = 0;
-  updateLoopCount();
 
-  loadAndPlay(video.id);
-
-  playbackStartTime = Date.now();
-  if (timerInterval) clearInterval(timerInterval);
-  timerInterval = setInterval(updateTimer, 1000);
-
-  // Polling safety net: detect video end even if 'ended' event doesn't fire (AirPlay issue)
-  startLoopMonitoring();
-}
-
-function loadAndPlay(videoId) {
-  const url = getPlaylistUrl(videoId);
-  videoPlayer.src = url;
+  // Relative URL — page is on network IP (auto-redirected from localhost)
+  // so AirPlay sends the correct URL to the Apple TV
+  videoPlayer.src = `/api/hls/${video.id}/playlist.m3u8`;
   videoPlayer.load();
 
   const playPromise = videoPlayer.play();
@@ -263,49 +241,14 @@ function loadAndPlay(videoId) {
       videoPlayer.addEventListener('click', () => videoPlayer.play(), { once: true });
     });
   }
-}
 
-// Polling every second to detect video end — critical for AirPlay
-// because the 'ended' event stops firing after the first loop on AirPlay
-function startLoopMonitoring() {
-  if (loopCheckInterval) clearInterval(loopCheckInterval);
-  loopCheckInterval = setInterval(() => {
-    if (!currentVideo) return;
-
-    const isEnded = videoPlayer.ended;
-    const isNearEnd = videoPlayer.duration > 0
-      && (videoPlayer.duration - videoPlayer.currentTime) < 0.5
-      && videoPlayer.paused;
-
-    if (isEnded || isNearEnd) {
-      console.log(`Loop detected (ended=${isEnded}, nearEnd=${isNearEnd}) — restarting`);
-      restartForLoop();
-    }
-  }, 1000);
-}
-
-function restartForLoop() {
-  if (!currentVideo) return;
-  loopCount++;
-  updateLoopCount();
-  console.log(`Boucle #${loopCount} — redémarrage`);
-
-  // Seamless seek to start (no black flash — works on local + AirPlay first loops)
-  videoPlayer.currentTime = 0;
-  const playPromise = videoPlayer.play();
-  if (playPromise) {
-    playPromise.catch(() => {
-      // Fallback: full src reload (causes brief flash but always works)
-      console.log('Seek failed, fallback to full reload');
-      loadAndPlay(currentVideo.id);
-    });
-  }
+  playbackStartTime = Date.now();
+  if (timerInterval) clearInterval(timerInterval);
+  timerInterval = setInterval(updateTimer, 1000);
 }
 
 function stopPlayback() {
   const videoToClean = currentVideo;
-
-  if (loopCheckInterval) { clearInterval(loopCheckInterval); loopCheckInterval = null; }
 
   videoPlayer.pause();
   videoPlayer.removeAttribute('src');
@@ -313,7 +256,6 @@ function stopPlayback() {
 
   currentVideo = null;
   playbackStartTime = null;
-  loopCount = 0;
   if (timerInterval) clearInterval(timerInterval);
 
   document.querySelectorAll('.video-item').forEach(el => el.classList.remove('active'));
@@ -340,17 +282,8 @@ function handleVideoPlaying() {
 }
 
 function handleVideoPause() {
-  // Don't show "En pause" if video ended (loop will restart it)
-  if (videoPlayer.ended) return;
   playStatus.textContent = 'En pause';
   playStatus.className = 'stat-value status-paused';
-}
-
-function handleVideoEnded() {
-  // 'ended' event fires on first loop — use it as primary trigger
-  if (!currentVideo) return;
-  console.log('Video ended event fired — restarting for loop');
-  restartForLoop();
 }
 
 function handleVideoError() {
@@ -360,10 +293,10 @@ function handleVideoError() {
   playStatus.textContent = 'Erreur — nouvelle tentative...';
   playStatus.className = 'stat-value status-waiting';
 
-  // For VOD HLS, a simple reload usually fixes transient errors
   setTimeout(() => {
     if (currentVideo) {
-      loadAndPlay(currentVideo.id);
+      videoPlayer.load();
+      videoPlayer.play().catch(() => {});
     }
   }, 3000);
 }
@@ -390,12 +323,6 @@ function updateTimer() {
   if (!playbackStartTime) return;
   const elapsed = Math.floor((Date.now() - playbackStartTime) / 1000);
   totalTimeEl.textContent = formatTime(elapsed);
-}
-
-function updateLoopCount() {
-  if (loopCountEl) {
-    loopCountEl.textContent = loopCount;
-  }
 }
 
 function formatTime(seconds) {
