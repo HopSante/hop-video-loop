@@ -2,8 +2,18 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 require('dotenv').config();
+
+// --- Resolve ffmpeg/ffprobe paths (system or npm-installed) ---
+let FFMPEG_PATH = 'ffmpeg';
+let FFPROBE_PATH = 'ffprobe';
+try { execSync('ffmpeg -version', { stdio: 'ignore' }); } catch {
+  try { FFMPEG_PATH = require('@ffmpeg-installer/ffmpeg').path; } catch {}
+}
+try { execSync('ffprobe -version', { stdio: 'ignore' }); } catch {
+  try { FFPROBE_PATH = require('@ffprobe-installer/ffprobe').path; } catch {}
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -90,7 +100,7 @@ function hlsReady(fileId) {
 
 function runFfmpeg(args, cwd) {
   return new Promise((resolve, reject) => {
-    const proc = spawn('ffmpeg', args, {
+    const proc = spawn(FFMPEG_PATH, args, {
       cwd: cwd || undefined,
       stdio: ['pipe', 'pipe', 'pipe']
     });
@@ -105,7 +115,7 @@ function runFfmpeg(args, cwd) {
 
 function checkHasAudio(videoPath) {
   return new Promise((resolve) => {
-    const proc = spawn('ffprobe', [
+    const proc = spawn(FFPROBE_PATH, [
       '-v', 'quiet', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', videoPath
     ]);
     let output = '';
