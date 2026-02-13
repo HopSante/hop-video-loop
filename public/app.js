@@ -233,9 +233,8 @@ function startPlayback(video) {
   videoPlayer.src = `/api/hls/${video.id}/playlist.m3u8`;
   videoPlayer.load();
 
-  // Don't auto-play — let user click play and choose AirPlay manually
-  playStatus.textContent = 'Appuyez sur Play';
-  playStatus.className = 'stat-value status-waiting';
+  // Auto-play locally (AirPlay requires manual activation by user)
+  videoPlayer.play().catch(() => {});
 
   playbackStartTime = Date.now();
   if (timerInterval) clearInterval(timerInterval);
