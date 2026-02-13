@@ -91,6 +91,9 @@ echo ""
 echo "🚀 Lancement de Hop Video Loop..."
 echo ""
 export PATH="$DEPS_DIR/bin:$DEPS_DIR/node/bin:$PATH"
-npm start &
-sleep 3
-open -a Safari http://localhost:3000
+
+# Ouvrir Safari après un délai (en arrière-plan)
+(sleep 3 && open -a Safari "http://localhost:3000") &
+
+# Lancer le serveur au premier plan (exec remplace le shell → le serveur survit)
+exec npm start
