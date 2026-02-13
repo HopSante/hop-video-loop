@@ -33,8 +33,7 @@ function clearCacheDir() {
 try { clearCacheDir(); } catch {}
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
-// Redirect localhost to network IP (AirPlay sends video URL to Apple TV,
-// which can't reach "localhost" — it needs the real network IP)
+// Redirect localhost → network IP (Apple TV can't reach localhost)
 app.use((req, res, next) => {
   const host = req.hostname;
   if (host === 'localhost' || host === '127.0.0.1') {
@@ -46,7 +45,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Request logging
 app.use((req, res, next) => {
   if (req.path.startsWith('/api/')) {
     const ua = req.headers['user-agent'] || '';
@@ -76,43 +74,92 @@ function getCachedFile(fileId) {
   return cached ? path.join(CACHE_DIR, cached) : null;
 }
 
-function getHlsDir(fileId) {
-  return path.join(CACHE_DIR, `${fileId}_hls`);
-}
+function getHlsDir(fileId) { return path.join(CACHE_DIR, `${fileId}_hls`); }
+function getPlaylistPath(fileId) { return path.join(getHlsDir(fileId), 'playlist.m3u8'); }
+function getOriginalPlaylistPath(fileId) { return path.join(getHlsDir(fileId), 'original.m3u8'); }
 
-function getPlaylistPath(fileId) {
-  return path.join(getHlsDir(fileId), 'playlist.m3u8');
-}
-
-function getOriginalPlaylistPath(fileId) {
-  return path.join(getHlsDir(fileId), 'original.m3u8');
-}
-
-function segmentCount(fileId) {
-  const m3u8Path = getOriginalPlaylistPath(fileId);
-  if (!fs.existsSync(m3u8Path)) return 0;
-  const content = fs.readFileSync(m3u8Path, 'utf8');
-  return (content.match(/#EXTINF/g) || []).length;
-}
-
-// ffmpeg finished = original playlist has #EXT-X-ENDLIST
-function ffmpegDone(fileId) {
-  const m3u8Path = getOriginalPlaylistPath(fileId);
-  if (!fs.existsSync(m3u8Path)) return false;
-  const content = fs.readFileSync(m3u8Path, 'utf8');
-  return content.includes('#EXT-X-ENDLIST');
-}
-
-// Final looped playlist ready to serve
 function hlsReady(fileId) {
-  const m3u8Path = getPlaylistPath(fileId);
-  if (!fs.existsSync(m3u8Path)) return false;
-  const content = fs.readFileSync(m3u8Path, 'utf8');
-  return content.includes('#EXT-X-ENDLIST');
+  const p = getPlaylistPath(fileId);
+  return fs.existsSync(p) && fs.readFileSync(p, 'utf8').includes('#EXT-X-ENDLIST');
 }
 
-// Create a looped playlist that references the same segments N times
-// so the Apple TV sees a single 6h+ video (no JS loop needed)
+// --- Video Processing Pipeline ---
+// 1. reencodeForAirPlay: Re-encode ONCE (Main profile, 4Mbps, add audio) → ~5-10s
+// 2. segmentToHls: Segment into HLS VOD with -c copy → instant
+// 3. createLoopedPlaylist: DISCONTINUITY for 6h → instant
+
+function runFfmpeg(args, cwd) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('ffmpeg', args, {
+      cwd: cwd || undefined,
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    let stderr = '';
+    proc.stderr.on('data', d => stderr += d);
+    proc.on('exit', code => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg code ${code}: ${stderr.slice(-200)}`));
+    });
+  });
+}
+
+function checkHasAudio(videoPath) {
+  return new Promise((resolve) => {
+    const proc = spawn('ffprobe', [
+      '-v', 'quiet', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', videoPath
+    ]);
+    let output = '';
+    proc.stdout.on('data', d => output += d);
+    proc.on('close', () => resolve(output.includes('audio')));
+  });
+}
+
+// Step 1: Re-encode for AirPlay compatibility
+// Fixes: missing audio, High profile→Main, BT.2020→BT.709, 24Mbps→4Mbps
+async function reencodeForAirPlay(videoPath, outputPath, hasAudio) {
+  const inputArgs = ['-i', videoPath];
+  const mapArgs = ['-map', '0:v:0'];
+
+  if (hasAudio) {
+    mapArgs.push('-map', '0:a:0');
+  } else {
+    inputArgs.push('-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo');
+    mapArgs.push('-map', '1:a:0');
+  }
+
+  try {
+    // Try hardware encoder first (fast)
+    await runFfmpeg([
+      ...inputArgs, ...mapArgs,
+      '-c:v', 'h264_videotoolbox', '-profile:v', 'main', '-b:v', '4000k',
+      '-c:a', 'aac', '-b:a', '128k', '-ar', '48000',
+      '-shortest', '-y', outputPath
+    ]);
+  } catch {
+    // Fallback: software encoder
+    await runFfmpeg([
+      ...inputArgs, ...mapArgs,
+      '-c:v', 'libx264', '-profile:v', 'main', '-level', '4.0',
+      '-preset', 'ultrafast', '-crf', '23', '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac', '-b:a', '128k', '-ar', '48000',
+      '-shortest', '-y', outputPath
+    ]);
+  }
+}
+
+// Step 2: Segment into HLS VOD (-c copy = instant)
+async function segmentToHls(inputPath, hlsDir) {
+  await runFfmpeg([
+    '-i', inputPath,
+    '-c', 'copy',
+    '-f', 'hls', '-hls_time', '10', '-hls_list_size', '0',
+    '-hls_playlist_type', 'vod', '-hls_segment_type', 'mpegts',
+    '-hls_segment_filename', 'seg_%05d.ts',
+    '-y', 'original.m3u8'
+  ], hlsDir);
+}
+
+// Step 3: DISCONTINUITY playlist for 6h
 function createLoopedPlaylist(fileId) {
   const originalPath = getOriginalPlaylistPath(fileId);
   const playlistPath = getPlaylistPath(fileId);
@@ -120,127 +167,51 @@ function createLoopedPlaylist(fileId) {
   const content = fs.readFileSync(originalPath, 'utf8');
   const lines = content.split('\n');
 
-  // Parse header and segment entries from original playlist
   const headerLines = [];
-  const segmentEntries = []; // [extinf_line, filename_line]
+  const segmentEntries = [];
   let totalDuration = 0;
   let inHeader = true;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
-    if (!line) continue;
-    if (line === '#EXT-X-ENDLIST') continue;
-    if (line.startsWith('#EXT-X-PLAYLIST-TYPE')) continue;
+    if (!line || line === '#EXT-X-ENDLIST' || line.startsWith('#EXT-X-PLAYLIST-TYPE')) continue;
 
     if (line.startsWith('#EXTINF:')) {
       inHeader = false;
-      const duration = parseFloat(line.split(':')[1].split(',')[0]);
-      totalDuration += duration;
-      const filename = (lines[i + 1] || '').trim();
-      segmentEntries.push([line, filename]);
+      totalDuration += parseFloat(line.split(':')[1]);
+      segmentEntries.push([line, (lines[i + 1] || '').trim()]);
       i++;
     } else if (inHeader) {
       headerLines.push(line);
     }
   }
 
-  if (segmentEntries.length === 0 || totalDuration === 0) {
-    console.error('  Erreur : playlist originale vide');
-    return false;
-  }
+  if (!segmentEntries.length || !totalDuration) return false;
 
   const targetSeconds = TARGET_LOOP_HOURS * 3600;
   const repetitions = Math.max(1, Math.ceil(targetSeconds / totalDuration));
-  const totalMinutes = Math.round(totalDuration * repetitions / 60);
 
-  console.log(`  Playlist bouclée : ${segmentEntries.length} segments × ${repetitions} rép. = ~${totalMinutes} min`);
+  if (repetitions <= 1) {
+    fs.copyFileSync(originalPath, playlistPath);
+    console.log(`  Playlist : ${segmentEntries.length} segments, ~${Math.round(totalDuration / 60)} min`);
+    return true;
+  }
 
-  // Build looped playlist
-  let playlist = headerLines.join('\n') + '\n';
-  playlist += '#EXT-X-PLAYLIST-TYPE:VOD\n';
+  console.log(`  Playlist : ${segmentEntries.length} seg × ${repetitions} rép = ~${Math.round(totalDuration * repetitions / 60)} min`);
 
+  let playlist = headerLines.join('\n') + '\n#EXT-X-PLAYLIST-TYPE:VOD\n';
   for (let r = 0; r < repetitions; r++) {
-    if (r > 0) {
-      playlist += '#EXT-X-DISCONTINUITY\n';
-    }
+    if (r > 0) playlist += '#EXT-X-DISCONTINUITY\n';
     for (const [extinf, filename] of segmentEntries) {
       playlist += extinf + '\n' + filename + '\n';
     }
   }
-
   playlist += '#EXT-X-ENDLIST\n';
   fs.writeFileSync(playlistPath, playlist);
   return true;
 }
 
-// --- ffmpeg processes ---
-const ffmpegProcesses = {};
-
-function spawnFfmpeg(fileId, videoPath, reencode = false) {
-  const hlsDir = getHlsDir(fileId);
-  if (fs.existsSync(hlsDir)) {
-    try { fs.rmSync(hlsDir, { recursive: true, force: true }); } catch {}
-  }
-  fs.mkdirSync(hlsDir, { recursive: true });
-
-  // VOD HLS: segment once, no real-time constraint, no loop
-  // Apple AirPlay best practices: Main profile, level 4.0, yuv420p, AAC-LC
-  const codecArgs = reencode
-    ? ['-c:v', 'libx264', '-profile:v', 'main', '-level', '4.0', '-pix_fmt', 'yuv420p',
-       '-preset', 'fast', '-crf', '23', '-sc_threshold', '0',
-       '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2']
-    : ['-c', 'copy'];
-
-  const args = [
-    '-i', videoPath,
-    ...codecArgs,
-    '-f', 'hls',
-    '-hls_time', '6',
-    '-hls_list_size', '0',
-    '-hls_playlist_type', 'vod',
-    '-hls_segment_type', 'mpegts',
-    '-hls_segment_filename', 'seg_%05d.ts',
-    '-y', 'original.m3u8'
-  ];
-
-  const label = reencode ? 'ffmpeg VOD re-encode' : 'ffmpeg VOD segment';
-  console.log(`  ${label} démarré pour ${fileId}`);
-
-  const proc = spawn('ffmpeg', args, {
-    cwd: hlsDir,
-    stdio: ['pipe', 'pipe', 'pipe']
-  });
-
-  ffmpegProcesses[fileId] = proc;
-
-  proc.stderr.on('data', (data) => {
-    const msg = data.toString();
-    if (msg.includes('Error') || msg.includes('error')) {
-      console.error(`  ${label} [${fileId}]: ${msg.trim()}`);
-    }
-  });
-
-  proc.on('exit', (code) => {
-    console.log(`  ${label} [${fileId}] terminé (code ${code})`);
-    delete ffmpegProcesses[fileId];
-  });
-
-  return proc;
-}
-
-function stopFfmpeg(fileId) {
-  const proc = ffmpegProcesses[fileId];
-  if (proc) {
-    try { proc.kill('SIGTERM'); } catch {}
-    delete ffmpegProcesses[fileId];
-  }
-}
-
-function stopAllFfmpeg() {
-  Object.keys(ffmpegProcesses).forEach(id => stopFfmpeg(id));
-}
-
-// --- Video list cache ---
+// --- Google Drive ---
 let videoListCache = null;
 let videoListCacheTime = 0;
 const CACHE_TTL = 5 * 60 * 1000;
@@ -253,16 +224,6 @@ function formatDriveVideo(f) {
       ? Math.round(parseInt(f.videoMediaMetadata.durationMillis) / 1000) : null,
   };
 }
-
-function enrichWithStatus(f) {
-  return { ...f, cached: !!getCachedFile(f.id), hlsReady: hlsReady(f.id) };
-}
-
-// --- Routes ---
-
-app.get('/api/info', (req, res) => {
-  res.json({ ip: getLocalIp(), port: PORT });
-});
 
 async function listDriveFiles(folderId, mimeFilter) {
   const q = mimeFilter
@@ -294,18 +255,16 @@ function updateVideoListCache(videos) {
   videoListCacheTime = Date.now();
 }
 
+// --- Routes ---
+
 app.get('/api/videos', async (req, res) => {
   try {
     const forceRefresh = req.query.refresh === '1';
-    const now = Date.now();
-
-    if (forceRefresh || !videoListCache || (now - videoListCacheTime) >= CACHE_TTL) {
+    if (forceRefresh || !videoListCache || (Date.now() - videoListCacheTime) >= CACHE_TTL) {
       updateVideoListCache(await fetchAllVideos());
     }
-
-    res.json(videoListCache.map(enrichWithStatus));
+    res.json(videoListCache.map(f => ({ ...f, cached: !!getCachedFile(f.id), hlsReady: hlsReady(f.id) })));
   } catch (err) {
-    console.error('Error listing videos:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -314,18 +273,6 @@ fetchAllVideos().then(videos => {
   updateVideoListCache(videos);
   console.log(`  Liste pré-chargée : ${videoListCache.length} vidéos`);
 }).catch(() => {});
-
-// Wait for ffmpeg to finish segmenting (original.m3u8 has #EXT-X-ENDLIST)
-async function waitForFfmpegDone(fileId, maxSeconds, send, statusPrefix) {
-  for (let i = 0; i < maxSeconds; i++) {
-    await new Promise(r => setTimeout(r, 1000));
-    if (ffmpegDone(fileId)) return true;
-    const count = segmentCount(fileId);
-    send({ type: 'status', message: `${statusPrefix} (${count} segments, ${i + 1}s)` });
-    if (!ffmpegProcesses[fileId]) return ffmpegDone(fileId);
-  }
-  return false;
-}
 
 app.get('/api/download/:fileId', async (req, res) => {
   const fileId = req.params.fileId;
@@ -336,37 +283,31 @@ app.get('/api/download/:fileId', async (req, res) => {
 
   try {
     if (hlsReady(fileId)) {
-      send({ type: 'complete', message: 'Prêt' });
+      send({ type: 'complete' });
       return res.end();
     }
 
+    // --- Download from Google Drive ---
     let cachedPath = getCachedFile(fileId);
 
     if (!cachedPath) {
-      send({ type: 'status', message: 'Récupération des métadonnées...' });
+      send({ type: 'status', message: 'Récupération...' });
       const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size,mimeType&key=${API_KEY}`;
-      const metaRes = await fetch(metaUrl);
-      const meta = await metaRes.json();
+      const meta = await (await fetch(metaUrl)).json();
       if (meta.error) { send({ type: 'error', message: meta.error.message }); return res.end(); }
 
       const totalSize = parseInt(meta.size) || 0;
       const ext = path.extname(meta.name) || '.mp4';
       cachedPath = path.join(CACHE_DIR, `${fileId}${ext}`);
-
       fs.writeFileSync(path.join(CACHE_DIR, `${fileId}.json`),
         JSON.stringify({ name: meta.name, mimeType: meta.mimeType, size: totalSize }));
 
       send({ type: 'status', message: 'Téléchargement...' });
-      const downloadUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${API_KEY}`;
-      const downloadRes = await fetch(downloadUrl);
-      if (!downloadRes.ok) {
-        send({ type: 'error', message: `Erreur ${downloadRes.status}` });
-        return res.end();
-      }
+      const downloadRes = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${API_KEY}`);
+      if (!downloadRes.ok) { send({ type: 'error', message: `Erreur ${downloadRes.status}` }); return res.end(); }
 
       const fileStream = fs.createWriteStream(cachedPath);
-      let downloaded = 0;
-      let lastPct = 0;
+      let downloaded = 0, lastPct = 0;
       const reader = downloadRes.body.getReader();
       while (true) {
         const { done, value } = await reader.read();
@@ -380,41 +321,34 @@ app.get('/api/download/:fileId', async (req, res) => {
         }
       }
       fileStream.end();
-      await new Promise((resolve, reject) => {
-        fileStream.on('finish', resolve);
-        fileStream.on('error', reject);
-      });
+      await new Promise((resolve, reject) => { fileStream.on('finish', resolve); fileStream.on('error', reject); });
     }
 
-    // Step 1: Segment video into HLS (fast, -c copy)
-    send({ type: 'status', message: 'Préparation des segments vidéo...' });
-    stopFfmpeg(fileId);
-    spawnFfmpeg(fileId, cachedPath);
+    // --- Prepare HLS for AirPlay ---
+    const hlsDir = getHlsDir(fileId);
+    if (fs.existsSync(hlsDir)) try { fs.rmSync(hlsDir, { recursive: true, force: true }); } catch {}
+    fs.mkdirSync(hlsDir, { recursive: true });
 
-    let ready = await waitForFfmpegDone(fileId, 120, send, 'Segmentation en cours...');
+    const hasAudio = await checkHasAudio(cachedPath);
+    const reencoded = path.join(hlsDir, 'source.mp4');
 
-    if (!ready && !ffmpegProcesses[fileId]) {
-      send({ type: 'status', message: 'Ré-encodage pour compatibilité AirPlay...' });
-      spawnFfmpeg(fileId, cachedPath, true);
-      ready = await waitForFfmpegDone(fileId, 300, send, 'Ré-encodage...');
-    }
+    // Step 1: Re-encode for AirPlay (~5-10s for a short video)
+    send({ type: 'status', message: 'Encodage AirPlay...' });
+    console.log(`  Re-encode AirPlay pour ${fileId} (audio: ${hasAudio})`);
+    await reencodeForAirPlay(cachedPath, reencoded, hasAudio);
 
-    if (!ready) {
-      stopFfmpeg(fileId);
-      send({ type: 'error', message: 'Impossible de préparer la vidéo' });
-      return res.end();
-    }
+    // Step 2: Segment into HLS VOD (instant)
+    send({ type: 'status', message: 'Segmentation...' });
+    await segmentToHls(reencoded, hlsDir);
 
-    // Step 2: Create looped playlist (same segments × N for 6h+)
-    send({ type: 'status', message: `Création de la boucle ${TARGET_LOOP_HOURS}h...` });
-    const looped = createLoopedPlaylist(fileId);
-    if (!looped) {
-      send({ type: 'error', message: 'Erreur création playlist bouclée' });
-      return res.end();
-    }
+    // Step 3: Loop playlist for 6h (instant)
+    createLoopedPlaylist(fileId);
 
-    console.log(`  VOD HLS bouclé prêt pour ${fileId}`);
-    send({ type: 'complete', message: 'Prêt' });
+    // Clean up intermediate
+    try { fs.unlinkSync(reencoded); } catch {}
+
+    console.log(`  HLS prêt pour ${fileId}`);
+    send({ type: 'complete' });
     res.end();
   } catch (err) {
     console.error('Download/HLS error:', err.message);
@@ -423,67 +357,33 @@ app.get('/api/download/:fileId', async (req, res) => {
   }
 });
 
-// --- HLS serving (static VOD segments) ---
+// --- HLS serving ---
 
 app.get('/api/hls/:fileId/playlist.m3u8', (req, res) => {
-  const m3u8Path = getPlaylistPath(req.params.fileId);
-  if (!fs.existsSync(m3u8Path)) return res.status(404).json({ error: 'Vidéo non prête' });
-
-  const content = fs.readFileSync(m3u8Path, 'utf8');
+  const p = getPlaylistPath(req.params.fileId);
+  if (!fs.existsSync(p)) return res.status(404).json({ error: 'Non prêt' });
   res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-  // VOD playlist is static — cache it but allow refresh
   res.setHeader('Cache-Control', 'public, max-age=3600');
-  res.setHeader('Connection', 'keep-alive');
-  res.send(content);
+  res.send(fs.readFileSync(p, 'utf8'));
 });
 
 app.get('/api/hls/:fileId/:segFile', (req, res) => {
   const { fileId, segFile } = req.params;
   if (!segFile.endsWith('.ts')) return res.status(400).end();
-
   const segPath = path.join(getHlsDir(fileId), segFile);
   if (!fs.existsSync(segPath)) return res.status(404).end();
-
   const stat = fs.statSync(segPath);
   res.setHeader('Content-Type', 'video/MP2T');
   res.setHeader('Content-Length', stat.size);
-  // VOD segments never change — cache aggressively
   res.setHeader('Cache-Control', 'public, max-age=86400');
   res.setHeader('Accept-Ranges', 'bytes');
-  res.setHeader('Connection', 'keep-alive');
   fs.createReadStream(segPath).pipe(res);
 });
 
-app.get('/api/play/:fileId', (req, res) => {
-  const filePath = getCachedFile(req.params.fileId);
-  if (!filePath) return res.status(404).json({ error: 'Non trouvé' });
-
-  const fileSize = fs.statSync(filePath).size;
-  const ext = path.extname(filePath).toLowerCase();
-  const mimeTypes = { '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.m4v': 'video/x-m4v' };
-  const mimeType = mimeTypes[ext] || 'video/mp4';
-  const range = req.headers.range;
-
-  if (range) {
-    const parts = range.replace(/bytes=/, '').split('-');
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-    res.writeHead(206, {
-      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-      'Accept-Ranges': 'bytes', 'Content-Length': end - start + 1, 'Content-Type': mimeType,
-    });
-    fs.createReadStream(filePath, { start, end }).pipe(res);
-  } else {
-    res.writeHead(200, {
-      'Content-Length': fileSize, 'Content-Type': mimeType, 'Accept-Ranges': 'bytes'
-    });
-    fs.createReadStream(filePath).pipe(res);
-  }
-});
+// --- Cache management ---
 
 app.delete('/api/cache/:fileId', (req, res) => {
   const fileId = req.params.fileId;
-  stopFfmpeg(fileId);
   const filePath = getCachedFile(fileId);
   const metaPath = path.join(CACHE_DIR, `${fileId}.json`);
   const hlsDir = getHlsDir(fileId);
@@ -493,31 +393,15 @@ app.delete('/api/cache/:fileId', (req, res) => {
   res.json({ success: true });
 });
 
-function handleClearCache(req, res) {
-  stopAllFfmpeg();
-  clearCacheDir();
-  res.json({ success: true });
-}
+function handleClearCache(req, res) { clearCacheDir(); res.json({ success: true }); }
 app.post('/api/cache/clear', handleClearCache);
 app.delete('/api/cache', handleClearCache);
 
-process.on('SIGTERM', () => { stopAllFfmpeg(); process.exit(0); });
-process.on('SIGINT', () => { stopAllFfmpeg(); process.exit(0); });
+// --- Start ---
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   const ip = getLocalIp();
-  console.log('');
-  console.log('  ╔══════════════════════════════════════════════╗');
-  console.log('  ║           Hop Video Loop                     ║');
-  console.log('  ╠══════════════════════════════════════════════╣');
-  console.log(`  ║  Local:   http://localhost:${PORT}              ║`);
-  console.log(`  ║  Réseau:  http://${ip}:${PORT}        ║`);
-  console.log('  ╠══════════════════════════════════════════════╣');
-  console.log('  ║  VOD HLS — AirPlay optimisé — boucle auto   ║');
-  console.log('  ╚══════════════════════════════════════════════╝');
-  console.log('');
-
-  // Keep-alive for AirPlay connections
+  console.log(`\n  Hop Video Loop — http://${ip}:${PORT}\n  VOD HLS — AirPlay optimisé — boucle ${TARGET_LOOP_HOURS}h\n`);
   server.keepAliveTimeout = 120000;
   server.headersTimeout = 125000;
 });
