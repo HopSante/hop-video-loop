@@ -142,8 +142,8 @@ export PATH="$DEPS_DIR/bin:$DEPS_DIR/node/bin:$PATH"
 LOCAL_IP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo "localhost")
 APP_URL="http://${LOCAL_IP}:3000"
 
-# Ouvrir OBLIGATOIREMENT dans Safari (pas le navigateur par défaut)
-(sleep 3 && open -a "Safari" "$APP_URL") &
+# Ouvrir UNIQUEMENT dans Safari (osascript évite que Chrome s'ouvre aussi)
+(sleep 3 && osascript -e "tell application \"Safari\" to open location \"$APP_URL\"") &
 
 # Lancer le serveur au premier plan (exec remplace le shell → le serveur survit)
 exec npm start
