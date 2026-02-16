@@ -2,6 +2,7 @@
 let currentVideo = null;
 let playbackStartTime = null;
 let timerInterval = null;
+let activeDownload = null;
 
 // --- DOM ---
 const videoList = document.getElementById('video-list');
@@ -153,8 +154,19 @@ async function loadVideos(forceRefresh = false) {
 
 // --- Video selection & download ---
 async function selectVideo(video) {
+  const wasDownloading = !!activeDownload;
+
+  // Cancel any active download before switching
+  if (activeDownload) {
+    activeDownload.close();
+    activeDownload = null;
+  }
+
   if (currentVideo && currentVideo.id !== video.id) {
-    clearVideoCache(currentVideo.id);
+    // Don't clear cache if previous video was mid-download (server still processing)
+    if (!wasDownloading) {
+      clearVideoCache(currentVideo.id);
+    }
     currentVideo.cached = false;
   }
 
@@ -190,6 +202,7 @@ async function selectVideo(video) {
 function downloadVideo(video) {
   return new Promise((resolve, reject) => {
     const evtSource = new EventSource(`/api/download/${video.id}`);
+    activeDownload = evtSource;
 
     evtSource.onmessage = (event) => {
       const data = JSON.parse(event.data);
@@ -206,11 +219,13 @@ function downloadVideo(video) {
 
         case 'complete':
           evtSource.close();
+          activeDownload = null;
           resolve();
           break;
 
         case 'error':
           evtSource.close();
+          activeDownload = null;
           reject(new Error(data.message));
           break;
       }
@@ -218,6 +233,7 @@ function downloadVideo(video) {
 
     evtSource.onerror = () => {
       evtSource.close();
+      activeDownload = null;
       reject(new Error('Connexion perdue pendant le téléchargement'));
     };
   });

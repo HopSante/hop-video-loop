@@ -21,7 +21,7 @@ const API_KEY = process.env.GOOGLE_API_KEY || 'AIzaSyAmk1UrzlVmGWdAeQ-dtYo0gyrkt
 const FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID || '19C-tRucX8LkVxHVOh3bxQMG9qc3C9jyC';
 const CACHE_DIR = path.join(__dirname, '.cache');
 const PRE_LOOP_TARGET_SECS = 120; // Pre-loop in ffmpeg → no DISCONTINUITY within group
-const TARGET_PLAYLIST_SECS = 3600; // Target 1h total playlist
+const TARGET_PLAYLIST_SECS = 21600; // Target max duration (size cap is the real limit)
 const MAX_PLAYLIST_ENTRIES = 500;  // Cap entries for TV compatibility
 
 // --- CORS (Apple TV fetches HLS segments directly via AirPlay) ---
