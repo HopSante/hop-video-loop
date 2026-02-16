@@ -259,7 +259,8 @@ function generateLivePlaylist(fileId) {
     prevLoop = loop;
 
     playlist += segments[segIdx].extinf + '\n';
-    playlist += segments[segIdx].filename + '\n';
+    // Unique URI per occurrence — HLS spec: players skip segments with same URI
+    playlist += segments[segIdx].filename + `?seq=${absIdx}\n`;
   }
 
   return playlist;
