@@ -33,6 +33,7 @@ async function init() {
   videoPlayer.addEventListener('playing', handleVideoPlaying);
   videoPlayer.addEventListener('pause', handleVideoPause);
   videoPlayer.addEventListener('error', handleVideoError);
+  videoPlayer.addEventListener('ended', handleVideoEnded);
 }
 
 // --- Video list ---
@@ -222,18 +223,15 @@ function downloadVideo(video) {
   });
 }
 
-// --- Playback (VOD HLS — 6h looped playlist, no JS loop needed) ---
+// --- Playback (VOD HLS with auto-restart) ---
 
 function startPlayback(video) {
   showState('player');
   nowPlayingName.textContent = video.name;
 
-  // Relative URL — page is on network IP (auto-redirected from localhost)
-  // so AirPlay sends the correct URL to the Apple TV
-  videoPlayer.src = `/api/hls/${video.id}/playlist.m3u8`;
+  // Cache-buster ensures fresh playlist on restart
+  videoPlayer.src = `/api/hls/${video.id}/playlist.m3u8?t=${Date.now()}`;
   videoPlayer.load();
-
-  // Auto-play locally (AirPlay requires manual activation by user)
   videoPlayer.play().catch(() => {});
 
   playbackStartTime = Date.now();
@@ -289,10 +287,15 @@ function handleVideoError() {
 
   setTimeout(() => {
     if (currentVideo) {
-      videoPlayer.load();
-      videoPlayer.play().catch(() => {});
+      startPlayback(currentVideo);
     }
-  }, 3000);
+  }, 2000);
+}
+
+function handleVideoEnded() {
+  if (!currentVideo) return;
+  // VOD playlist ended — seamless restart for infinite loop
+  startPlayback(currentVideo);
 }
 
 function toggleFullscreen() {

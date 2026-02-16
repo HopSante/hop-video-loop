@@ -20,9 +20,7 @@ const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.GOOGLE_API_KEY || 'AIzaSyAmk1UrzlVmGWdAeQ-dtYo0gyrktrMPOu8';
 const FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID || '19C-tRucX8LkVxHVOh3bxQMG9qc3C9jyC';
 const CACHE_DIR = path.join(__dirname, '.cache');
-
-// LIVE HLS state — sliding window playlist instead of massive VOD
-const liveStreams = new Map();
+const MAX_LOOP_REPS = 100; // ~33 min per cycle, JS auto-restarts
 
 // --- CORS (Apple TV fetches HLS segments directly via AirPlay) ---
 app.use((req, res, next) => {
@@ -35,7 +33,6 @@ app.use((req, res, next) => {
 });
 
 function clearCacheDir() {
-  liveStreams.clear();
   if (fs.existsSync(CACHE_DIR)) {
     for (const entry of fs.readdirSync(CACHE_DIR)) {
       try { fs.rmSync(path.join(CACHE_DIR, entry), { recursive: true, force: true }); } catch {}
@@ -88,17 +85,18 @@ function getCachedFile(fileId) {
 }
 
 function getHlsDir(fileId) { return path.join(CACHE_DIR, `${fileId}_hls`); }
+function getPlaylistPath(fileId) { return path.join(getHlsDir(fileId), 'playlist.m3u8'); }
 function getOriginalPlaylistPath(fileId) { return path.join(getHlsDir(fileId), 'original.m3u8'); }
 
 function hlsReady(fileId) {
-  const p = getOriginalPlaylistPath(fileId);
+  const p = getPlaylistPath(fileId);
   return fs.existsSync(p) && fs.readFileSync(p, 'utf8').includes('#EXT-X-ENDLIST');
 }
 
 // --- Video Processing Pipeline ---
 // 1. reencodeForAirPlay: Re-encode ONCE (Main profile, 4Mbps, add audio) → ~5-10s
 // 2. segmentToHls: Segment into HLS VOD with -c copy → instant
-// 3. LIVE playlist served dynamically (sliding window — no massive VOD file)
+// 3. createLoopedPlaylist: VOD with path-based unique URIs (r0/, r1/...)
 
 function runFfmpeg(args, cwd) {
   return new Promise((resolve, reject) => {
@@ -171,99 +169,53 @@ async function segmentToHls(inputPath, hlsDir) {
   ], hlsDir);
 }
 
-// Step 3: LIVE HLS — parse original.m3u8 and store segment metadata
-function initLiveStream(fileId) {
+// Step 3: VOD playlist with path-based unique URIs (r0/seg.ts, r1/seg.ts...)
+// AVFoundation ignores query params for segment identity, so we use path prefixes.
+// Limited to MAX_LOOP_REPS repetitions; JS auto-restarts when VOD ends.
+function createLoopedPlaylist(fileId) {
   const originalPath = getOriginalPlaylistPath(fileId);
-  if (!fs.existsSync(originalPath)) return false;
+  const playlistPath = getPlaylistPath(fileId);
 
   const content = fs.readFileSync(originalPath, 'utf8');
   const lines = content.split('\n');
 
-  const segments = [];
-  let targetDuration = 10;
+  const headerLines = [];
+  const segmentEntries = [];
+  let totalDuration = 0;
+  let inHeader = true;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
-    if (line.startsWith('#EXT-X-TARGETDURATION:')) {
-      targetDuration = parseInt(line.split(':')[1]);
-    }
+    if (!line || line === '#EXT-X-ENDLIST' || line.startsWith('#EXT-X-PLAYLIST-TYPE')) continue;
+
     if (line.startsWith('#EXTINF:')) {
-      const duration = parseFloat(line.split(':')[1]);
-      const filename = (lines[i + 1] || '').trim();
-      segments.push({ duration, filename, extinf: line });
+      inHeader = false;
+      totalDuration += parseFloat(line.split(':')[1]);
+      segmentEntries.push([line, (lines[i + 1] || '').trim()]);
       i++;
+    } else if (inHeader) {
+      headerLines.push(line);
     }
   }
 
-  if (!segments.length) return false;
+  if (!segmentEntries.length || !totalDuration) return false;
 
-  const totalDuration = segments.reduce((sum, s) => sum + s.duration, 0);
+  const repetitions = Math.min(MAX_LOOP_REPS, Math.max(1, Math.ceil(21600 / totalDuration)));
 
-  liveStreams.set(fileId, {
-    segments,
-    targetDuration,
-    totalDuration,
-    startTime: Date.now(),
-  });
+  console.log(`  Playlist : ${segmentEntries.length} seg × ${repetitions} rép = ~${Math.round(totalDuration * repetitions / 60)} min`);
 
-  console.log(`  LIVE stream : ${segments.length} seg × ~${Math.round(totalDuration)}s — boucle infinie`);
+  let playlist = headerLines.join('\n') + '\n#EXT-X-PLAYLIST-TYPE:VOD\n';
+  for (let r = 0; r < repetitions; r++) {
+    if (r > 0) playlist += '#EXT-X-DISCONTINUITY\n';
+    for (const [extinf, filename] of segmentEntries) {
+      // Path-based unique URI: r0/seg_00000.ts, r1/seg_00000.ts, etc.
+      // AVFoundation treats different paths as distinct segments
+      playlist += extinf + '\n' + `r${r}/${filename}` + '\n';
+    }
+  }
+  playlist += '#EXT-X-ENDLIST\n';
+  fs.writeFileSync(playlistPath, playlist);
   return true;
-}
-
-// Generate a small sliding-window LIVE playlist (7 segments max)
-function generateLivePlaylist(fileId) {
-  const stream = liveStreams.get(fileId);
-  if (!stream) return null;
-
-  const { segments, targetDuration, totalDuration } = stream;
-  const segCount = segments.length;
-
-  // Calculate current position based on elapsed time
-  const elapsed = (Date.now() - stream.startTime) / 1000;
-  const loopsCompleted = Math.floor(elapsed / totalDuration);
-  const posInLoop = elapsed % totalDuration;
-
-  // Find which segment we're in
-  let segInLoop = 0;
-  let acc = 0;
-  for (let i = 0; i < segCount; i++) {
-    acc += segments[i].duration;
-    if (acc >= posInLoop) {
-      segInLoop = i;
-      break;
-    }
-  }
-
-  const currentSeg = loopsCompleted * segCount + segInLoop;
-
-  // Sliding window: 3 segments behind + current + 3 ahead
-  const startSeq = Math.max(0, currentSeg - 3);
-  const windowSize = 7;
-
-  let playlist = '#EXTM3U\n';
-  playlist += '#EXT-X-VERSION:3\n';
-  playlist += `#EXT-X-TARGETDURATION:${targetDuration}\n`;
-  playlist += `#EXT-X-MEDIA-SEQUENCE:${startSeq}\n`;
-  // No PLAYLIST-TYPE = LIVE stream
-  // No ENDLIST = stream never ends
-
-  let prevLoop = Math.floor(startSeq / segCount);
-  for (let i = 0; i < windowSize; i++) {
-    const absIdx = startSeq + i;
-    const loop = Math.floor(absIdx / segCount);
-    const segIdx = absIdx % segCount;
-
-    if (i > 0 && loop !== prevLoop) {
-      playlist += '#EXT-X-DISCONTINUITY\n';
-    }
-    prevLoop = loop;
-
-    playlist += segments[segIdx].extinf + '\n';
-    // Unique URI per occurrence — HLS spec: players skip segments with same URI
-    playlist += segments[segIdx].filename + `?seq=${absIdx}\n`;
-  }
-
-  return playlist;
 }
 
 // --- Google Drive ---
@@ -396,8 +348,8 @@ app.get('/api/download/:fileId', async (req, res) => {
     send({ type: 'status', message: 'Segmentation...' });
     await segmentToHls(reencoded, hlsDir);
 
-    // Step 3: Initialize LIVE stream (dynamic playlist)
-    initLiveStream(fileId);
+    // Step 3: Create looped VOD playlist with unique paths
+    createLoopedPlaylist(fileId);
 
     // Clean up intermediate
     try { fs.unlinkSync(reencoded); } catch {}
@@ -412,28 +364,18 @@ app.get('/api/download/:fileId', async (req, res) => {
   }
 });
 
-// --- HLS serving (LIVE sliding window) ---
+// --- HLS serving (VOD with path-based unique URIs) ---
 
 app.get('/api/hls/:fileId/playlist.m3u8', (req, res) => {
-  const fileId = req.params.fileId;
-
-  // Lazy-init: if segments exist but stream not in memory (e.g. after page reload)
-  if (!liveStreams.has(fileId)) {
-    if (!initLiveStream(fileId)) {
-      return res.status(404).json({ error: 'Non prêt' });
-    }
-  }
-
-  const playlist = generateLivePlaylist(fileId);
-  if (!playlist) return res.status(404).json({ error: 'Non prêt' });
-
+  const p = getPlaylistPath(req.params.fileId);
+  if (!fs.existsSync(p)) return res.status(404).json({ error: 'Non prêt' });
   res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-  // LIVE = no cache — player must re-fetch to get updated window
-  res.setHeader('Cache-Control', 'no-cache, no-store');
-  res.send(playlist);
+  res.setHeader('Cache-Control', 'no-cache');
+  res.send(fs.readFileSync(p, 'utf8'));
 });
 
-app.get('/api/hls/:fileId/:segFile', (req, res) => {
+// Segments with loop prefix: /api/hls/:fileId/r5/seg_00001.ts → serves seg_00001.ts
+app.get('/api/hls/:fileId/:rep/:segFile', (req, res) => {
   const { fileId, segFile } = req.params;
   if (!segFile.endsWith('.ts')) return res.status(400).end();
   const segPath = path.join(getHlsDir(fileId), segFile);
@@ -441,8 +383,7 @@ app.get('/api/hls/:fileId/:segFile', (req, res) => {
   const stat = fs.statSync(segPath);
   res.setHeader('Content-Type', 'video/MP2T');
   res.setHeader('Content-Length', stat.size);
-  // Short cache — segments repeat in LIVE loops, player must re-fetch
-  res.setHeader('Cache-Control', 'public, max-age=30');
+  res.setHeader('Cache-Control', 'public, max-age=86400');
   res.setHeader('Accept-Ranges', 'bytes');
   fs.createReadStream(segPath).pipe(res);
 });
@@ -451,7 +392,6 @@ app.get('/api/hls/:fileId/:segFile', (req, res) => {
 
 app.delete('/api/cache/:fileId', (req, res) => {
   const fileId = req.params.fileId;
-  liveStreams.delete(fileId);
   const filePath = getCachedFile(fileId);
   const metaPath = path.join(CACHE_DIR, `${fileId}.json`);
   const hlsDir = getHlsDir(fileId);
@@ -469,7 +409,7 @@ app.delete('/api/cache', handleClearCache);
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   const ip = getLocalIp();
-  console.log(`\n  Hop Video Loop — http://${ip}:${PORT}\n  LIVE HLS — AirPlay optimisé — boucle infinie\n`);
+  console.log(`\n  Hop Video Loop — http://${ip}:${PORT}\n  VOD HLS — AirPlay optimisé — boucle auto\n`);
   server.keepAliveTimeout = 120000;
   server.headersTimeout = 125000;
 });
