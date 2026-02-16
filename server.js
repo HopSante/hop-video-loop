@@ -150,7 +150,7 @@ async function reencodeForAirPlay(videoPath, outputPath, hasAudio) {
     // Try hardware encoder first (fast)
     await runFfmpeg([
       ...inputArgs, ...mapArgs,
-      '-c:v', 'h264_videotoolbox', '-profile:v', 'main', '-b:v', '4000k',
+      '-c:v', 'h264_videotoolbox', '-profile:v', 'main', '-b:v', '3000k',
       '-c:a', 'aac', '-b:a', '128k', '-ar', '48000',
       '-shortest', '-y', outputPath
     ]);
@@ -169,7 +169,7 @@ async function reencodeForAirPlay(videoPath, outputPath, hasAudio) {
 // Step 2: Full-duration continuous loop + segment into HLS VOD
 // -stream_loop creates ONE continuous stream with 0 DISCONTINUITY tags.
 // Old WebOS TVs crash on DISCONTINUITY — this approach avoids them entirely.
-// Trade-off: ~9GB disk for 5h at 4Mbps (cleared on restart).
+// Trade-off: ~6.75GB disk for 5h at 3Mbps (cleared on restart).
 async function segmentToHls(inputPath, hlsDir, videoDuration) {
   const loopCount = Math.max(1, Math.ceil(LOOP_DURATION_SECS / videoDuration));
   const totalSecs = Math.ceil(videoDuration * loopCount);
