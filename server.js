@@ -150,7 +150,7 @@ async function reencodeForAirPlay(videoPath, outputPath, hasAudio) {
     // Try hardware encoder first (fast)
     await runFfmpeg([
       ...inputArgs, ...mapArgs,
-      '-c:v', 'h264_videotoolbox', '-profile:v', 'main', '-b:v', '2000k',
+      '-c:v', 'h264_videotoolbox', '-profile:v', 'main', '-b:v', '4000k',
       '-c:a', 'aac', '-b:a', '128k', '-ar', '48000',
       '-shortest', '-y', outputPath
     ]);
@@ -159,7 +159,7 @@ async function reencodeForAirPlay(videoPath, outputPath, hasAudio) {
     await runFfmpeg([
       ...inputArgs, ...mapArgs,
       '-c:v', 'libx264', '-profile:v', 'main', '-level', '4.0',
-      '-preset', 'ultrafast', '-b:v', '2000k', '-pix_fmt', 'yuv420p',
+      '-preset', 'ultrafast', '-crf', '23', '-pix_fmt', 'yuv420p',
       '-c:a', 'aac', '-b:a', '128k', '-ar', '48000',
       '-shortest', '-y', outputPath
     ]);
@@ -169,7 +169,7 @@ async function reencodeForAirPlay(videoPath, outputPath, hasAudio) {
 // Step 2: Full-duration continuous loop + segment into HLS VOD
 // -stream_loop creates ONE continuous stream with 0 DISCONTINUITY tags.
 // Old WebOS TVs crash on DISCONTINUITY — this approach avoids them entirely.
-// Trade-off: ~6GB disk for 6h at 2Mbps (cleared on restart).
+// Trade-off: ~11GB disk for 6h at 4Mbps (cleared on restart).
 async function segmentToHls(inputPath, hlsDir, videoDuration) {
   const loopCount = Math.max(1, Math.ceil(LOOP_DURATION_SECS / videoDuration));
   const totalSecs = Math.ceil(videoDuration * loopCount);
@@ -184,7 +184,7 @@ async function segmentToHls(inputPath, hlsDir, videoDuration) {
     '-i', inputPath,
     '-t', String(totalSecs),
     '-c', 'copy',
-    '-f', 'hls', '-hls_time', '30', '-hls_list_size', '0',
+    '-f', 'hls', '-hls_time', '10', '-hls_list_size', '0',
     '-hls_playlist_type', 'vod', '-hls_segment_type', 'mpegts',
     '-hls_segment_filename', 'seg_%05d.ts',
     '-y', 'playlist.m3u8'
