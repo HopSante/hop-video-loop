@@ -20,9 +20,7 @@ const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.GOOGLE_API_KEY || 'AIzaSyAmk1UrzlVmGWdAeQ-dtYo0gyrktrMPOu8';
 const FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID || '19C-tRucX8LkVxHVOh3bxQMG9qc3C9jyC';
 const CACHE_DIR = path.join(__dirname, '.cache');
-const PRE_LOOP_TARGET_SECS = 120; // Pre-loop in ffmpeg → no DISCONTINUITY within group
-const TARGET_PLAYLIST_SECS = 21600; // Target max duration (size cap is the real limit)
-const MAX_PLAYLIST_ENTRIES = 500;  // Cap entries for TV compatibility
+const LOOP_DURATION_SECS = 1200; // 20 min continuous loop — 0 DISCONTINUITY for old TV compat
 
 // --- CORS (Apple TV fetches HLS segments directly via AirPlay) ---
 app.use((req, res, next) => {
@@ -88,7 +86,6 @@ function getCachedFile(fileId) {
 
 function getHlsDir(fileId) { return path.join(CACHE_DIR, `${fileId}_hls`); }
 function getPlaylistPath(fileId) { return path.join(getHlsDir(fileId), 'playlist.m3u8'); }
-function getOriginalPlaylistPath(fileId) { return path.join(getHlsDir(fileId), 'original.m3u8'); }
 
 function hlsReady(fileId) {
   const p = getPlaylistPath(fileId);
@@ -97,8 +94,7 @@ function hlsReady(fileId) {
 
 // --- Video Processing Pipeline ---
 // 1. reencodeForAirPlay: Re-encode ONCE (Main profile, 4Mbps, add audio) → ~5-10s
-// 2. segmentToHls: Pre-loop + segment into HLS VOD with -c copy
-// 3. createLoopedPlaylist: Path-based unique URIs (r0/, r1/...) — TV-friendly size
+// 2. segmentToHls: Full-duration loop + segment into HLS VOD (-c copy, 0 DISCONTINUITY)
 
 function runFfmpeg(args, cwd) {
   return new Promise((resolve, reject) => {
@@ -170,73 +166,30 @@ async function reencodeForAirPlay(videoPath, outputPath, hasAudio) {
   }
 }
 
-// Step 2: Pre-loop + segment into HLS VOD (-c copy = fast)
-// -stream_loop creates a continuous stream → NO DISCONTINUITY within the group
-async function segmentToHls(inputPath, hlsDir, loopCount) {
+// Step 2: Full-duration continuous loop + segment into HLS VOD
+// -stream_loop creates ONE continuous stream with 0 DISCONTINUITY tags.
+// Old WebOS TVs crash on DISCONTINUITY — this approach avoids them entirely.
+// Trade-off: ~600MB disk for 20min of a short video (cleared on restart).
+async function segmentToHls(inputPath, hlsDir, videoDuration) {
+  const loopCount = Math.max(1, Math.ceil(LOOP_DURATION_SECS / videoDuration));
+  const totalSecs = Math.ceil(videoDuration * loopCount);
+
+  console.log(`  Boucle continue : ${loopCount}x (~${Math.round(totalSecs / 60)} min, 0 DISCONTINUITY)`);
+
   const args = [];
   if (loopCount > 1) {
     args.push('-stream_loop', String(loopCount - 1));
   }
   args.push(
     '-i', inputPath,
+    '-t', String(totalSecs),
     '-c', 'copy',
     '-f', 'hls', '-hls_time', '10', '-hls_list_size', '0',
     '-hls_playlist_type', 'vod', '-hls_segment_type', 'mpegts',
     '-hls_segment_filename', 'seg_%05d.ts',
-    '-y', 'original.m3u8'
+    '-y', 'playlist.m3u8'
   );
   await runFfmpeg(args, hlsDir);
-}
-
-// Step 3: VOD playlist with path-based unique URIs (r0/seg.ts, r1/seg.ts...)
-// AVFoundation ignores query params for segment identity, so we use path prefixes.
-// Capped by MAX_PLAYLIST_ENTRIES for TV compatibility; JS auto-restarts when VOD ends.
-function createLoopedPlaylist(fileId) {
-  const originalPath = getOriginalPlaylistPath(fileId);
-  const playlistPath = getPlaylistPath(fileId);
-
-  const content = fs.readFileSync(originalPath, 'utf8');
-  const lines = content.split('\n');
-
-  const headerLines = [];
-  const segmentEntries = [];
-  let totalDuration = 0;
-  let inHeader = true;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (!line || line === '#EXT-X-ENDLIST' || line.startsWith('#EXT-X-PLAYLIST-TYPE')) continue;
-
-    if (line.startsWith('#EXTINF:')) {
-      inHeader = false;
-      totalDuration += parseFloat(line.split(':')[1]);
-      segmentEntries.push([line, (lines[i + 1] || '').trim()]);
-      i++;
-    } else if (inHeader) {
-      headerLines.push(line);
-    }
-  }
-
-  if (!segmentEntries.length || !totalDuration) return false;
-
-  const maxBySize = Math.max(1, Math.floor(MAX_PLAYLIST_ENTRIES / segmentEntries.length));
-  const maxByTime = Math.max(1, Math.ceil(TARGET_PLAYLIST_SECS / totalDuration));
-  const repetitions = Math.min(maxBySize, maxByTime);
-
-  console.log(`  Playlist : ${segmentEntries.length} seg × ${repetitions} rép = ~${Math.round(totalDuration * repetitions / 60)} min`);
-
-  let playlist = headerLines.join('\n') + '\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-PLAYLIST-TYPE:VOD\n';
-  for (let r = 0; r < repetitions; r++) {
-    if (r > 0) playlist += '#EXT-X-DISCONTINUITY\n';
-    for (const [extinf, filename] of segmentEntries) {
-      // Path-based unique URI: r0/seg_00000.ts, r1/seg_00000.ts, etc.
-      // AVFoundation treats different paths as distinct segments
-      playlist += extinf + '\n' + `r${r}/${filename}` + '\n';
-    }
-  }
-  playlist += '#EXT-X-ENDLIST\n';
-  fs.writeFileSync(playlistPath, playlist);
-  return true;
 }
 
 // --- Google Drive ---
@@ -365,15 +318,10 @@ app.get('/api/download/:fileId', async (req, res) => {
     console.log(`  Re-encode AirPlay pour ${fileId} (audio: ${hasAudio})`);
     await reencodeForAirPlay(cachedPath, reencoded, hasAudio);
 
-    // Step 2: Pre-loop + segment into HLS VOD
+    // Step 2: Loop + segment into continuous HLS (0 DISCONTINUITY)
     send({ type: 'status', message: 'Segmentation...' });
     const duration = await getVideoDuration(reencoded);
-    const loopCount = Math.max(1, Math.min(10, Math.ceil(PRE_LOOP_TARGET_SECS / duration)));
-    console.log(`  Pre-loop : ${loopCount}x (${Math.round(duration * loopCount)}s par groupe)`);
-    await segmentToHls(reencoded, hlsDir, loopCount);
-
-    // Step 3: Create looped VOD playlist with unique paths
-    createLoopedPlaylist(fileId);
+    await segmentToHls(reencoded, hlsDir, duration);
 
     // Clean up intermediate
     try { fs.unlinkSync(reencoded); } catch {}
@@ -388,7 +336,7 @@ app.get('/api/download/:fileId', async (req, res) => {
   }
 });
 
-// --- HLS serving (VOD with path-based unique URIs) ---
+// --- HLS serving (continuous VOD — 0 DISCONTINUITY) ---
 
 app.get('/api/hls/:fileId/playlist.m3u8', (req, res) => {
   const p = getPlaylistPath(req.params.fileId);
@@ -398,8 +346,8 @@ app.get('/api/hls/:fileId/playlist.m3u8', (req, res) => {
   res.send(fs.readFileSync(p, 'utf8'));
 });
 
-// Segments with loop prefix: /api/hls/:fileId/r5/seg_00001.ts → serves seg_00001.ts
-app.get('/api/hls/:fileId/:rep/:segFile', (req, res) => {
+// Serve HLS segments directly: /api/hls/:fileId/seg_00001.ts
+app.get('/api/hls/:fileId/:segFile', (req, res) => {
   const { fileId, segFile } = req.params;
   if (!segFile.endsWith('.ts')) return res.status(400).end();
   const segPath = path.join(getHlsDir(fileId), segFile);
