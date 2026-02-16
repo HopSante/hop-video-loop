@@ -20,7 +20,7 @@ const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.GOOGLE_API_KEY || 'AIzaSyAmk1UrzlVmGWdAeQ-dtYo0gyrktrMPOu8';
 const FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID || '19C-tRucX8LkVxHVOh3bxQMG9qc3C9jyC';
 const CACHE_DIR = path.join(__dirname, '.cache');
-const LOOP_DURATION_SECS = 21600; // 6h continuous loop — 0 DISCONTINUITY, no restart needed
+const LOOP_DURATION_SECS = 18000; // 5h continuous loop — 0 DISCONTINUITY, no restart needed
 
 // --- CORS (Apple TV fetches HLS segments directly via AirPlay) ---
 app.use((req, res, next) => {
@@ -169,7 +169,7 @@ async function reencodeForAirPlay(videoPath, outputPath, hasAudio) {
 // Step 2: Full-duration continuous loop + segment into HLS VOD
 // -stream_loop creates ONE continuous stream with 0 DISCONTINUITY tags.
 // Old WebOS TVs crash on DISCONTINUITY — this approach avoids them entirely.
-// Trade-off: ~11GB disk for 6h at 4Mbps (cleared on restart).
+// Trade-off: ~9GB disk for 5h at 4Mbps (cleared on restart).
 async function segmentToHls(inputPath, hlsDir, videoDuration) {
   const loopCount = Math.max(1, Math.ceil(LOOP_DURATION_SECS / videoDuration));
   const totalSecs = Math.ceil(videoDuration * loopCount);
