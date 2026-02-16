@@ -20,7 +20,9 @@ const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.GOOGLE_API_KEY || 'AIzaSyAmk1UrzlVmGWdAeQ-dtYo0gyrktrMPOu8';
 const FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID || '19C-tRucX8LkVxHVOh3bxQMG9qc3C9jyC';
 const CACHE_DIR = path.join(__dirname, '.cache');
-const MAX_LOOP_REPS = 1080; // covers ~6h for a 20s video
+const PRE_LOOP_TARGET_SECS = 120; // Pre-loop in ffmpeg → no DISCONTINUITY within group
+const TARGET_PLAYLIST_SECS = 3600; // Target 1h total playlist
+const MAX_PLAYLIST_ENTRIES = 500;  // Cap entries for TV compatibility
 
 // --- CORS (Apple TV fetches HLS segments directly via AirPlay) ---
 app.use((req, res, next) => {
@@ -95,8 +97,8 @@ function hlsReady(fileId) {
 
 // --- Video Processing Pipeline ---
 // 1. reencodeForAirPlay: Re-encode ONCE (Main profile, 4Mbps, add audio) → ~5-10s
-// 2. segmentToHls: Segment into HLS VOD with -c copy → instant
-// 3. createLoopedPlaylist: VOD with path-based unique URIs (r0/, r1/...)
+// 2. segmentToHls: Pre-loop + segment into HLS VOD with -c copy
+// 3. createLoopedPlaylist: Path-based unique URIs (r0/, r1/...) — TV-friendly size
 
 function runFfmpeg(args, cwd) {
   return new Promise((resolve, reject) => {
@@ -121,6 +123,17 @@ function checkHasAudio(videoPath) {
     let output = '';
     proc.stdout.on('data', d => output += d);
     proc.on('close', () => resolve(output.includes('audio')));
+  });
+}
+
+function getVideoDuration(videoPath) {
+  return new Promise((resolve) => {
+    const proc = spawn(FFPROBE_PATH, [
+      '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', videoPath
+    ]);
+    let output = '';
+    proc.stdout.on('data', d => output += d);
+    proc.on('close', () => resolve(parseFloat(output.trim()) || 20));
   });
 }
 
@@ -157,21 +170,27 @@ async function reencodeForAirPlay(videoPath, outputPath, hasAudio) {
   }
 }
 
-// Step 2: Segment into HLS VOD (-c copy = instant)
-async function segmentToHls(inputPath, hlsDir) {
-  await runFfmpeg([
+// Step 2: Pre-loop + segment into HLS VOD (-c copy = fast)
+// -stream_loop creates a continuous stream → NO DISCONTINUITY within the group
+async function segmentToHls(inputPath, hlsDir, loopCount) {
+  const args = [];
+  if (loopCount > 1) {
+    args.push('-stream_loop', String(loopCount - 1));
+  }
+  args.push(
     '-i', inputPath,
     '-c', 'copy',
     '-f', 'hls', '-hls_time', '10', '-hls_list_size', '0',
     '-hls_playlist_type', 'vod', '-hls_segment_type', 'mpegts',
     '-hls_segment_filename', 'seg_%05d.ts',
     '-y', 'original.m3u8'
-  ], hlsDir);
+  );
+  await runFfmpeg(args, hlsDir);
 }
 
 // Step 3: VOD playlist with path-based unique URIs (r0/seg.ts, r1/seg.ts...)
 // AVFoundation ignores query params for segment identity, so we use path prefixes.
-// Limited to MAX_LOOP_REPS repetitions; JS auto-restarts when VOD ends.
+// Capped by MAX_PLAYLIST_ENTRIES for TV compatibility; JS auto-restarts when VOD ends.
 function createLoopedPlaylist(fileId) {
   const originalPath = getOriginalPlaylistPath(fileId);
   const playlistPath = getPlaylistPath(fileId);
@@ -200,11 +219,13 @@ function createLoopedPlaylist(fileId) {
 
   if (!segmentEntries.length || !totalDuration) return false;
 
-  const repetitions = Math.min(MAX_LOOP_REPS, Math.max(1, Math.ceil(21600 / totalDuration)));
+  const maxBySize = Math.max(1, Math.floor(MAX_PLAYLIST_ENTRIES / segmentEntries.length));
+  const maxByTime = Math.max(1, Math.ceil(TARGET_PLAYLIST_SECS / totalDuration));
+  const repetitions = Math.min(maxBySize, maxByTime);
 
   console.log(`  Playlist : ${segmentEntries.length} seg × ${repetitions} rép = ~${Math.round(totalDuration * repetitions / 60)} min`);
 
-  let playlist = headerLines.join('\n') + '\n#EXT-X-PLAYLIST-TYPE:VOD\n';
+  let playlist = headerLines.join('\n') + '\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-PLAYLIST-TYPE:VOD\n';
   for (let r = 0; r < repetitions; r++) {
     if (r > 0) playlist += '#EXT-X-DISCONTINUITY\n';
     for (const [extinf, filename] of segmentEntries) {
@@ -344,9 +365,12 @@ app.get('/api/download/:fileId', async (req, res) => {
     console.log(`  Re-encode AirPlay pour ${fileId} (audio: ${hasAudio})`);
     await reencodeForAirPlay(cachedPath, reencoded, hasAudio);
 
-    // Step 2: Segment into HLS VOD (instant)
+    // Step 2: Pre-loop + segment into HLS VOD
     send({ type: 'status', message: 'Segmentation...' });
-    await segmentToHls(reencoded, hlsDir);
+    const duration = await getVideoDuration(reencoded);
+    const loopCount = Math.max(1, Math.min(10, Math.ceil(PRE_LOOP_TARGET_SECS / duration)));
+    console.log(`  Pre-loop : ${loopCount}x (${Math.round(duration * loopCount)}s par groupe)`);
+    await segmentToHls(reencoded, hlsDir, loopCount);
 
     // Step 3: Create looped VOD playlist with unique paths
     createLoopedPlaylist(fileId);

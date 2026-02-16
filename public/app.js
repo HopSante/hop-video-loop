@@ -294,8 +294,14 @@ function handleVideoError() {
 
 function handleVideoEnded() {
   if (!currentVideo) return;
-  // VOD playlist ended — seamless restart for infinite loop
-  startPlayback(currentVideo);
+  // VOD playlist ended — restart for infinite loop
+  // Try seeking to start (seamless for AirPlay), fallback to reload
+  try {
+    videoPlayer.currentTime = 0;
+    videoPlayer.play().catch(() => startPlayback(currentVideo));
+  } catch {
+    startPlayback(currentVideo);
+  }
 }
 
 function toggleFullscreen() {
