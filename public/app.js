@@ -22,7 +22,6 @@ const totalTimeEl = document.getElementById('total-time');
 const playStatus = document.getElementById('play-status');
 const fullscreenBtn = document.getElementById('fullscreen-btn');
 const stopBtn = document.getElementById('stop-btn');
-
 // --- Init ---
 async function init() {
   loadVideos();

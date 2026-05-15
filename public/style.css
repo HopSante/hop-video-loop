@@ -35,10 +35,12 @@ body {
   padding: 16px;
 }
 
-/* Header */
+/* Header — draggable pour déplacer la fenêtre (titleBarStyle: hiddenInset) */
 header {
   text-align: center;
   margin-bottom: 12px;
+  -webkit-app-region: drag;
+  padding-top: 8px;
 }
 
 header h1 {
@@ -500,6 +502,14 @@ header h1 {
 .action-btn-danger:hover {
   background: rgba(255, 69, 58, 0.15);
   color: var(--danger);
+}
+
+.action-btn-airplay {
+  color: var(--accent);
+}
+
+.action-btn-airplay:hover {
+  background: var(--accent-subtle);
 }
 
 /* Error state */

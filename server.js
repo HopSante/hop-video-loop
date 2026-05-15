@@ -17,8 +17,13 @@ try { execSync('ffprobe -version', { stdio: 'ignore' }); } catch {
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.GOOGLE_API_KEY || 'AIzaSyAmk1UrzlVmGWdAeQ-dtYo0gyrktrMPOu8';
-const FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID || '19C-tRucX8LkVxHVOh3bxQMG9qc3C9jyC';
+const API_KEY = process.env.GOOGLE_API_KEY;
+const FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
+
+if (!API_KEY || !FOLDER_ID) {
+  console.error('GOOGLE_API_KEY et GOOGLE_DRIVE_FOLDER_ID requis');
+  process.exit(1);
+}
 const CACHE_DIR = path.join(__dirname, '.cache');
 const LOOP_DURATION_SECS = 18000; // 5h continuous loop — 0 DISCONTINUITY, no restart needed
 
@@ -44,9 +49,12 @@ try { clearCacheDir(); } catch {}
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
 // Redirect localhost → network IP (Apple TV can't reach localhost)
+// Skip redirect for Electron (UA contains "Electron") — it works fine on localhost
 app.use((req, res, next) => {
   const host = req.hostname;
   if (host === 'localhost' || host === '127.0.0.1') {
+    const ua = req.headers['user-agent'] || '';
+    if (ua.includes('Electron')) return next();
     const ip = getLocalIp();
     if (ip !== 'localhost') {
       return res.redirect(301, `http://${ip}:${PORT}${req.originalUrl}`);
@@ -377,6 +385,11 @@ function handleClearCache(req, res) { clearCacheDir(); res.json({ success: true 
 app.post('/api/cache/clear', handleClearCache);
 app.delete('/api/cache', handleClearCache);
 
+// Network info for AirPlay button in Electron
+app.get('/api/network-info', (req, res) => {
+  res.json({ ip: getLocalIp(), port: PORT });
+});
+
 // --- Start ---
 
 const server = app.listen(PORT, '0.0.0.0', () => {
@@ -385,3 +398,28 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   server.keepAliveTimeout = 120000;
   server.headersTimeout = 125000;
 });
+
+// --- Heartbeat App HS (badge "En ligne" dans /admin/outils-internes/diffuseur/workers) ---
+const HEARTBEAT_TOKEN = process.env.HOP_VL_WORKER_TOKEN;
+const HEARTBEAT_BASE = process.env.HOP_API_BASE_URL;
+const HEARTBEAT_INTERVAL_MS = 30_000;
+
+if (HEARTBEAT_TOKEN && HEARTBEAT_BASE) {
+  async function sendHeartbeat() {
+    try {
+      const res = await fetch(`${HEARTBEAT_BASE}/api/programmation/workers/heartbeat`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${HEARTBEAT_TOKEN}` },
+      });
+      if (!res.ok) {
+        console.warn(`[heartbeat] HTTP ${res.status}`);
+      }
+    } catch (err) {
+      console.warn('[heartbeat] échec:', err.message);
+    }
+  }
+  sendHeartbeat();
+  setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS);
+} else {
+  console.warn('[heartbeat] HOP_VL_WORKER_TOKEN ou HOP_API_BASE_URL absent — pas de heartbeat');
+}
